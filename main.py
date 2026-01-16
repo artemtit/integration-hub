@@ -4,260 +4,288 @@ from fastapi import FastAPI, Body
 from dotenv import load_dotenv
 from supabase import create_client
 
-# =========================
+# -------------------------
 # ENV
-# =========================
+# -------------------------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 app = FastAPI()
 
-# =========================
-# TELEGRAM HELPERS
-# =========================
-def send_message(chat_id: int, text: str, keyboard: dict | None = None):
+# -------------------------
+# Keyboards (reply keyboards)
+# -------------------------
+def keyboard_main():
+    return {
+        "keyboard": [
+            [{"text": "➕ Подключить сервис"}],
+            [{"text": "📦 Мои сервисы"}, {"text": "🗑️ Управление"}],
+            [{"text": "ℹ️ Помощь"}, {"text": "🔁 Главное меню"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
+def keyboard_services():
+    return {
+        "keyboard": [
+            [{"text": "GitHub"}, {"text": "GitLab (скоро)"}],
+            [{"text": "Notion (скоро)"}, {"text": "Webhook (custom)"}],
+            [{"text": "⬅️ Назад"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
+def keyboard_back_to_main():
+    return {
+        "keyboard": [
+            [{"text": "🔁 Главное меню"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
+def keyboard_manage():
+    return {
+        "keyboard": [
+            [{"text": "Удалить сервис"}, {"text": "Обновить список"}],
+            [{"text": "⬅️ Назад"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
+# -------------------------
+# Telegram helpers
+# -------------------------
+def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "Markdown"
     }
-    if keyboard:
-        payload["reply_markup"] = keyboard
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     r = requests.post(url, json=payload)
     if r.status_code != 200:
-        print("Telegram error:", r.text)
+        print("Telegram send error:", r.status_code, r.text)
 
-
-def edit_message(chat_id: int, message_id: int, text: str, keyboard: dict | None = None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    if keyboard:
-        payload["reply_markup"] = keyboard
-    r = requests.post(url, json=payload)
-    if r.status_code != 200:
-        print("Telegram edit error:", r.text)
-
-# =========================
-# KEYBOARDS
-# =========================
-def main_menu_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "➕ Подключить сервис", "callback_data": "connect_service"}],
-            [{"text": "📦 Мои сервисы", "callback_data": "my_services"}],
-            [{"text": "ℹ️ Помощь", "callback_data": "help"}]
-        ]
-    }
-
-
-def services_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "GitHub", "callback_data": "connect_github"}],
-            [{"text": "GitLab (скоро)", "callback_data": "soon"}],
-            [{"text": "Notion (скоро)", "callback_data": "soon"}],
-            [{"text": "Stripe (скоро)", "callback_data": "soon"}],
-            [{"text": "Webhook (custom)", "callback_data": "soon"}],
-            [{"text": "⬅️ Назад", "callback_data": "back_to_menu"}]
-        ]
-    }
-
-
-def back_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "⬅️ Назад", "callback_data": "back_to_menu"}]
-        ]
-    }
-
-# =========================
-# HEALTH (cron / monitoring)
-# =========================
+# -------------------------
+# Health
+# -------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# =========================
-# TELEGRAM WEBHOOK
-# =========================
+# -------------------------
+# Telegram webhook (message-based keyboard UX)
+# -------------------------
 @app.post("/telegram")
 async def telegram_update(payload: dict = Body(...)):
-    # -------- MESSAGE --------
-    if "message" in payload:
-        message = payload["message"]
-        chat_id = message["chat"]["id"]
-        text = message.get("text", "")
+    # only accept regular messages (we no longer use callback_query)
+    message = payload.get("message")
+    if not message:
+        return {"ok": True}
 
-        # регистрация пользователя (idempotent)
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    text = message.get("text", "").strip()
+
+    # idempotent upsert: если уже есть — обновит, иначе вставит
+    try:
         supabase.table("users").upsert(
             {"chat_id": chat_id},
             on_conflict="chat_id"
         ).execute()
+    except Exception as e:
+        # логируем, но не падаем
+        print("Supabase upsert error:", e)
 
-
-        if text == "/start":
-            send_message(
-                chat_id,
-                "👋 *Integration Hub*\n\n"
-                "Подключай сервисы и получай уведомления прямо в Telegram.\n\n"
-                "Выбери действие 👇",
-                main_menu_keyboard()
-            )
-
+    # ---- Main flows: text equal to the keyboard labels ----
+    if text in ("/start", "🔁 Главное меню", "Главное меню"):
+        send_message(
+            chat_id,
+            "👋 *Integration Hub*\n\n"
+            "Подключай сервисы и получай уведомления прямо в Telegram.\n\n"
+            "Выбери действие кнопкой ниже 👇",
+            keyboard_main()
+        )
         return {"ok": True}
 
-    # -------- CALLBACK QUERY --------
-    if "callback_query" in payload:
-        callback = payload["callback_query"]
-        data = callback["data"]
-        chat_id = callback["message"]["chat"]["id"]
-        message_id = callback["message"]["message_id"]
+    if text == "➕ Подключить сервис":
+        send_message(
+            chat_id,
+            "➕ *Подключение сервиса*\n\nВыбери сервис для подключения:",
+            keyboard_services()
+        )
+        return {"ok": True}
 
-        # Главное меню
-        if data == "back_to_menu":
-            edit_message(
-                chat_id,
-                message_id,
-                "👋 *Integration Hub*\n\n"
-                "Выбери действие 👇",
-                main_menu_keyboard()
-            )
+    if text == "GitHub":
+        # получаем user id
+        user_resp = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
+        if not user_resp.data:
+            send_message(chat_id, "❌ Пользователь не найден. Нажми /start.", keyboard_back_to_main())
+            return {"ok": True}
+        user_id = user_resp.data[0]["id"]
+        webhook = supabase.table("webhooks").insert({
+            "user_id": user_id,
+            "source": "github"
+        }).execute()
+        webhook_id = webhook.data[0]["id"]
+        webhook_url = f"{BASE_URL}/webhook/github/{webhook_id}"
 
-        # Подключить сервис
-        elif data == "connect_service":
-            edit_message(
-                chat_id,
-                message_id,
-                "➕ *Подключение сервиса*\n\n"
-                "Выбери сервис:",
-                services_keyboard()
-            )
+        send_message(
+            chat_id,
+            "🔗 *GitHub подключение*\n\n"
+            "1) Зайди в репозиторий GitHub\n"
+            "2) Settings → Webhooks → Add webhook\n"
+            f"3) Payload URL: `{webhook_url}`\n"
+            "4) Content type: `application/json`\n"
+            "5) Events: `Push`\n\n"
+            "После этого коммиты будут приходить в этот чат.",
+            keyboard_main()
+        )
+        return {"ok": True}
 
-        # GitHub
-        elif data == "connect_github":
-            user_resp = supabase.table("users") \
-                .select("id") \
-                .eq("chat_id", chat_id) \
-                .execute()
+    if text == "Webhook (custom)":
+        # quick generic webhook creation
+        user_resp = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
+        if not user_resp.data:
+            send_message(chat_id, "❌ Пользователь не найден. Нажми /start.", keyboard_back_to_main())
+            return {"ok": True}
+        user_id = user_resp.data[0]["id"]
+        webhook = supabase.table("webhooks").insert({
+            "user_id": user_id,
+            "source": "custom"
+        }).execute()
+        webhook_id = webhook.data[0]["id"]
+        webhook_url = f"{BASE_URL}/webhook/custom/{webhook_id}"
+        send_message(
+            chat_id,
+            "🔗 *Generic Webhook (custom)*\n\n"
+            f"POST your JSON to `{webhook_url}`\n\n"
+            "Мы автоматически отправим красиво отформатированное сообщение в Telegram.",
+            keyboard_main()
+        )
+        return {"ok": True}
 
+    if text == "📦 Мои сервисы":
+        # показать только сервисы текущего пользователя
+        user_resp = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
+        if not user_resp.data:
+            send_message(chat_id, "У вас ещё нет аккаунта, нажмите /start.", keyboard_main())
+            return {"ok": True}
+        user_id = user_resp.data[0]["id"]
+        services = supabase.table("webhooks").select("id,source,created_at").eq("user_id", user_id).execute()
+        if not services.data:
+            send_message(chat_id, "📦 У вас пока нет подключённых сервисов.", keyboard_main())
+            return {"ok": True}
+        text_out = "📦 *Ваши сервисы:*\n\n"
+        for row in services.data:
+            text_out += f"• `{row['source']}` — id: `{row['id']}`\n"
+        send_message(chat_id, text_out, keyboard_manage())
+        return {"ok": True}
+
+    if text == "Обновить список":
+        # просто триггер для пересоздания списка
+        send_message(chat_id, "Обновляю список...", keyboard_main())
+        # делаем вызов "Мои сервисы"
+        return await telegram_update({"message": {"chat": {"id": chat_id}, "text": "📦 Мои сервисы"}})
+
+    if text == "Удалить сервис":
+        send_message(chat_id,
+                     "Чтобы удалить сервис, отправь сообщение в формате:\n`Удалить <id>`\nПример: `Удалить eb3a-...`",
+                     keyboard_back_to_main())
+        return {"ok": True}
+
+    if text.startswith("Удалить "):
+        parts = text.split()
+        if len(parts) >= 2:
+            token = parts[1].strip()
+            # удаляем webhook только если он принадлежит пользователю
+            user_resp = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
             if not user_resp.data:
-                send_message(chat_id, "❌ Пользователь не найден")
+                send_message(chat_id, "Пользователь не найден.", keyboard_main())
                 return {"ok": True}
-
             user_id = user_resp.data[0]["id"]
+            # проверяем наличие
+            wh = supabase.table("webhooks").select("id").eq("id", token).eq("user_id", user_id).execute()
+            if not wh.data:
+                send_message(chat_id, "Сервис не найден или не принадлежит вам.", keyboard_main())
+                return {"ok": True}
+            supabase.table("webhooks").delete().eq("id", token).execute()
+            send_message(chat_id, "✅ Сервис удалён.", keyboard_main())
+            return {"ok": True}
 
-            webhook = supabase.table("webhooks").insert({
-                "user_id": user_id,
-                "source": "github"
-            }).execute()
-
-            webhook_id = webhook.data[0]["id"]
-            webhook_url = f"{BASE_URL}/webhook/github/{webhook_id}"
-
-            edit_message(
-                chat_id,
-                message_id,
-                "🔗 *GitHub подключение*\n\n"
-                "1️⃣ Зайди в репозиторий GitHub\n"
-                "2️⃣ Settings → Webhooks → Add webhook\n"
-                "3️⃣ Payload URL:\n"
-                f"`{webhook_url}`\n"
-                "4️⃣ Content type: application/json\n"
-                "5️⃣ Events: Push\n\n"
-                "После этого коммиты начнут приходить сюда 👇",
-                back_keyboard()
-            )
-
-        # Мои сервисы
-        elif data == "my_services":
-            services = supabase.table("webhooks") \
-                .select("source") \
-                .execute()
-
-            if services.data:
-                text = "📦 *Ваши сервисы:*\n\n"
-                for s in services.data:
-                    text += f"• {s['source']} — ✅ активен\n"
-            else:
-                text = "📦 *У вас пока нет подключённых сервисов*"
-
-            edit_message(chat_id, message_id, text, back_keyboard())
-
-        # Помощь
-        elif data == "help":
-            edit_message(
-                chat_id,
-                message_id,
-                "ℹ️ *Помощь*\n\n"
-                "• Подключай сервисы кнопками\n"
-                "• У каждого сервиса своя ссылка\n"
-                "• Уведомления приходят автоматически\n\n"
-                "Скоро появятся новые интеграции 🚀",
-                back_keyboard()
-            )
-
-        # Заглушка
-        elif data == "soon":
-            edit_message(
-                chat_id,
-                message_id,
-                "⏳ Этот сервис скоро будет доступен.\n\n"
-                "GitHub уже работает ✅",
-                back_keyboard()
-            )
-
+    if text == "ℹ️ Помощь":
+        send_message(chat_id,
+                     "ℹ️ *Помощь*\n\n"
+                     "• Используй клавиатуру для управления\n"
+                     "• Подключай GitHub и Generic Webhook\n"
+                     "• Для удаления используйте `Удалить <id>`\n\n"
+                     "Если нужно — пиши разработчику.",
+                     keyboard_main())
         return {"ok": True}
 
+    # default: если не распознано
+    send_message(chat_id,
+                 "Не понял команду. Используй клавиатуру ниже.",
+                 keyboard_main())
     return {"ok": True}
 
-# =========================
-# GITHUB WEBHOOK (FIXED)
-# =========================
+# -------------------------
+# GITHUB webhook (same safe handling)
+# -------------------------
 @app.post("/webhook/github/{webhook_id}")
 async def github_webhook(webhook_id: str, payload: dict = Body(...)):
-    webhook_resp = supabase.table("webhooks") \
-        .select("user_id") \
-        .eq("id", webhook_id) \
-        .execute()
-
+    webhook_resp = supabase.table("webhooks").select("user_id,source").eq("id", webhook_id).execute()
     if not webhook_resp.data:
         print(f"Unknown webhook_id: {webhook_id}")
         return {"status": "unknown webhook"}
 
     user_id = webhook_resp.data[0]["user_id"]
-
-    user_resp = supabase.table("users") \
-        .select("chat_id") \
-        .eq("id", user_id) \
-        .execute()
-
+    user_resp = supabase.table("users").select("chat_id").eq("id", user_id).execute()
     if not user_resp.data:
         print(f"User not found for webhook: {webhook_id}")
         return {"status": "unknown user"}
 
     chat_id = user_resp.data[0]["chat_id"]
-
     repo = payload.get("repository", {}).get("name", "unknown")
     author = payload.get("sender", {}).get("login", "unknown")
-
-    message = (
-        "🔔 *GitHub push*\n"
-        f"Repository: {repo}\n"
-        f"Author: {author}"
-    )
-
+    # более аккуратный формат сообщения
+    message = f"🔔 *GitHub push*\nRepository: `{repo}`\nAuthor: `{author}`"
     send_message(chat_id, message)
+    return {"status": "ok"}
+
+# -------------------------
+# GENERIC custom webhook
+# -------------------------
+@app.post("/webhook/custom/{webhook_id}")
+async def custom_webhook(webhook_id: str, payload: dict = Body(...)):
+    webhook_resp = supabase.table("webhooks").select("user_id,source").eq("id", webhook_id).execute()
+    if not webhook_resp.data:
+        print(f"Unknown custom webhook_id: {webhook_id}")
+        return {"status": "unknown webhook"}
+    user_id = webhook_resp.data[0]["user_id"]
+    user_resp = supabase.table("users").select("chat_id").eq("id", user_id).execute()
+    if not user_resp.data:
+        print(f"User not found for custom webhook: {webhook_id}")
+        return {"status": "unknown user"}
+
+    chat_id = user_resp.data[0]["chat_id"]
+    # постим упрощённый prettified JSON
+    try:
+        import json
+        pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+        text = f"🔔 *Custom webhook event*\n```json\n{pretty}\n```"
+    except Exception:
+        text = "🔔 *Custom webhook event*\n(не смогли отобразить тело)"
+    send_message(chat_id, text)
     return {"status": "ok"}
