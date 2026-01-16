@@ -102,9 +102,11 @@ async def telegram_update(payload: dict = Body(...)):
         text = message.get("text", "")
 
         # регистрация пользователя (idempotent)
-        supabase.table("users").upsert({
-            "chat_id": chat_id
-        }).execute()
+        supabase.table("users").upsert(
+            {"chat_id": chat_id},
+            on_conflict="chat_id"
+        ).execute()
+
 
         if text == "/start":
             send_message(
