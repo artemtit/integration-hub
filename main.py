@@ -9,7 +9,8 @@ load_dotenv()
 app = FastAPI()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BASE_URL = "https://shenika-graphophonic-inexhaustibly.ngrok-free.dev"
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+
 
 
 
