@@ -24,10 +24,16 @@ app = FastAPI()
 # =========================
 def send_message(chat_id: int, text: str, keyboard: dict | None = None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
     if keyboard:
         payload["reply_markup"] = keyboard
-    requests.post(url, json=payload)
+    r = requests.post(url, json=payload)
+    if r.status_code != 200:
+        print("Telegram error:", r.text)
 
 
 def edit_message(chat_id: int, message_id: int, text: str, keyboard: dict | None = None):
@@ -35,12 +41,14 @@ def edit_message(chat_id: int, message_id: int, text: str, keyboard: dict | None
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text
+        "text": text,
+        "parse_mode": "Markdown"
     }
     if keyboard:
         payload["reply_markup"] = keyboard
-    requests.post(url, json=payload)
-
+    r = requests.post(url, json=payload)
+    if r.status_code != 200:
+        print("Telegram edit error:", r.text)
 
 # =========================
 # KEYBOARDS
@@ -75,7 +83,6 @@ def back_keyboard():
         ]
     }
 
-
 # =========================
 # HEALTH (cron / monitoring)
 # =========================
@@ -83,13 +90,12 @@ def back_keyboard():
 async def health():
     return {"status": "ok"}
 
-
 # =========================
 # TELEGRAM WEBHOOK
 # =========================
 @app.post("/telegram")
 async def telegram_update(payload: dict = Body(...)):
-    # ---------- MESSAGE ----------
+    # -------- MESSAGE --------
     if "message" in payload:
         message = payload["message"]
         chat_id = message["chat"]["id"]
@@ -105,13 +111,13 @@ async def telegram_update(payload: dict = Body(...)):
                 chat_id,
                 "👋 *Integration Hub*\n\n"
                 "Подключай сервисы и получай уведомления прямо в Telegram.\n\n"
-                "Выбери действие ниже 👇",
+                "Выбери действие 👇",
                 main_menu_keyboard()
             )
 
         return {"ok": True}
 
-    # ---------- CALLBACK QUERY ----------
+    # -------- CALLBACK QUERY --------
     if "callback_query" in payload:
         callback = payload["callback_query"]
         data = callback["data"]
@@ -140,13 +146,16 @@ async def telegram_update(payload: dict = Body(...)):
 
         # GitHub
         elif data == "connect_github":
-            user = supabase.table("users") \
+            user_resp = supabase.table("users") \
                 .select("id") \
                 .eq("chat_id", chat_id) \
-                .single() \
                 .execute()
 
-            user_id = user.data["id"]
+            if not user_resp.data:
+                send_message(chat_id, "❌ Пользователь не найден")
+                return {"ok": True}
+
+            user_id = user_resp.data[0]["id"]
 
             webhook = supabase.table("webhooks").insert({
                 "user_id": user_id,
@@ -163,7 +172,7 @@ async def telegram_update(payload: dict = Body(...)):
                 "1️⃣ Зайди в репозиторий GitHub\n"
                 "2️⃣ Settings → Webhooks → Add webhook\n"
                 "3️⃣ Payload URL:\n"
-                f"{webhook_url}\n"
+                f"`{webhook_url}`\n"
                 "4️⃣ Content type: application/json\n"
                 "5️⃣ Events: Push\n\n"
                 "После этого коммиты начнут приходить сюда 👇",
@@ -183,12 +192,7 @@ async def telegram_update(payload: dict = Body(...)):
             else:
                 text = "📦 *У вас пока нет подключённых сервисов*"
 
-            edit_message(
-                chat_id,
-                message_id,
-                text,
-                back_keyboard()
-            )
+            edit_message(chat_id, message_id, text, back_keyboard())
 
         # Помощь
         elif data == "help":
@@ -217,30 +221,32 @@ async def telegram_update(payload: dict = Body(...)):
 
     return {"ok": True}
 
-
 # =========================
-# GITHUB WEBHOOK
+# GITHUB WEBHOOK (FIXED)
 # =========================
 @app.post("/webhook/github/{webhook_id}")
 async def github_webhook(webhook_id: str, payload: dict = Body(...)):
-    webhook = supabase.table("webhooks") \
+    webhook_resp = supabase.table("webhooks") \
         .select("user_id") \
         .eq("id", webhook_id) \
-        .single() \
         .execute()
 
-    if not webhook.data:
+    if not webhook_resp.data:
+        print(f"Unknown webhook_id: {webhook_id}")
         return {"status": "unknown webhook"}
 
-    user_id = webhook.data["user_id"]
+    user_id = webhook_resp.data[0]["user_id"]
 
-    user = supabase.table("users") \
+    user_resp = supabase.table("users") \
         .select("chat_id") \
         .eq("id", user_id) \
-        .single() \
         .execute()
 
-    chat_id = user.data["chat_id"]
+    if not user_resp.data:
+        print(f"User not found for webhook: {webhook_id}")
+        return {"status": "unknown user"}
+
+    chat_id = user_resp.data[0]["chat_id"]
 
     repo = payload.get("repository", {}).get("name", "unknown")
     author = payload.get("sender", {}).get("login", "unknown")
