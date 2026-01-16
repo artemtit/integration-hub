@@ -13,6 +13,9 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 def send_telegram_message(chat_id: int, text: str, keyboard=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
