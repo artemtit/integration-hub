@@ -42,6 +42,21 @@ def ttl_cleaner():
 threading.Thread(target=ttl_cleaner, daemon=True).start()
 
 # =========================
+# HELPERS
+# =========================
+def fmt_dt(dt):
+    """Форматирует datetime или ISO-строку в 'DD.MM.YYYY HH:MM:SS UTC'."""
+    if not dt:
+        return ""
+    if isinstance(dt, datetime):
+        return dt.strftime("%d.%m.%Y %H:%M:%S UTC")
+    try:
+        # ожидаем ISO строку
+        return dt.replace("T", " ").split(".")[0] + " UTC"
+    except Exception:
+        return str(dt)
+
+# =========================
 # TELEGRAM HELPERS
 # =========================
 def send_message(chat_id: int, text: str, keyboard: dict | None = None):
@@ -144,22 +159,20 @@ def service_manage_keyboard(webhook_id: str):
         ]
     }
 
-# экран управления сервисом: toggle, delete, back
-def service_settings_keyboard(webhook_id: str, enabled: bool):
+# ---- настройки сервиса: кнопки событий + delete + back ----
+def service_settings_keyboard(webhook_id: str, events: dict):
+    # events: dict like {"push": True, "pull_request": True, "issues": True}
+    def btn(label, key):
+        emoji = "✅" if events.get(key, True) else "❌"
+        return {"text": f"{emoji} {label}", "callback_data": f"toggle_event:{webhook_id}:{key}"}
+
     return {
         "inline_keyboard": [
-            [
-                {
-                    "text": f"🔔 Уведомления: {'ВКЛ' if enabled else 'ВЫКЛ'}",
-                    "callback_data": f"toggle:{webhook_id}"
-                }
-            ],
-            [
-                {"text": "❌ Удалить сервис", "callback_data": f"delete:{webhook_id}"}
-            ],
-            [
-                {"text": "⬅️ Назад", "callback_data": "back_services"}
-            ]
+            [btn("Push", "push")],
+            [btn("Pull Requests", "pull_request")],
+            [btn("Issues", "issues")],
+            [{"text": "❌ Удалить сервис", "callback_data": f"delete:{webhook_id}"}],
+            [{"text": "⬅️ Назад", "callback_data": "back_services"}]
         ]
     }
 
@@ -191,7 +204,7 @@ async def telegram_update(payload: dict = Body(...)):
         message_id = callback["message"]["message_id"]
         answer_callback(callback["id"])
 
-        # details (unchanged)
+        # details (из GITHUB_EVENTS)
         if data.startswith("details:"):
             event_id = data.split(":", 1)[1]
             ev = GITHUB_EVENTS.get(event_id)
@@ -204,10 +217,12 @@ async def telegram_update(payload: dict = Body(...)):
                 return {"ok": True}
 
             p = ev["payload"]
+            created = fmt_dt(ev.get("created_at"))
             text = (
                 "📄 *Подробности GitHub события*\n\n"
                 f"📦 Репозиторий:\n{p['repository']['name']}\n"
-                f"👤 Автор:\n{p.get('sender', {}).get('login', 'unknown')}\n\n"
+                f"👤 Автор:\n{p.get('sender', {}).get('login', 'unknown')}\n"
+                f"🕒 Время прихода:\n{created}\n\n"
                 "📝 Коммиты:\n"
             )
             for i, c in enumerate(p.get("commits", []), 1):
@@ -216,7 +231,7 @@ async def telegram_update(payload: dict = Body(...)):
             send_message(chat_id, text)
             return {"ok": True}
 
-        # open event (unchanged)
+        # open event (показываем полную дату/время created_at из БД)
         if data.startswith("open:"):
             event_id = data.split(":", 1)[1]
             ev = supabase.table("events").select("*").eq("id", event_id).execute()
@@ -229,11 +244,13 @@ async def telegram_update(payload: dict = Body(...)):
                 return {"ok": True}
 
             e = ev.data[0]
+            created_str = fmt_dt(e.get("received_at") or e.get("created_at"))
             send_message(
                 chat_id,
                 "📄 *Событие*\n\n"
-                f"Источник: `{e['source']}`\n\n"
-                f"{e['title']}"
+                f"Источник: `{e.get('source')}`\n"
+                f"Дата и время прихода: `{created_str}`\n\n"
+                f"{e.get('title')}"
             )
             return {"ok": True}
 
@@ -247,48 +264,50 @@ async def telegram_update(payload: dict = Body(...)):
         # manage -> open settings (edit message to settings view)
         if data.startswith("manage:"):
             wid = data.split(":", 1)[1]
-            res = supabase.table("webhooks").select("display_name,notifications_enabled").eq("id", wid).execute()
+            # get events_enabled (default to all true)
+            res = supabase.table("webhooks").select("display_name,events_enabled").eq("id", wid).execute()
             if not res.data:
                 send_message(chat_id, "❌ Сервис не найден.", main_keyboard())
                 return {"ok": True}
             wh = res.data[0]
-            enabled = True
-            if "notifications_enabled" in wh and wh["notifications_enabled"] is not None:
-                enabled = bool(wh["notifications_enabled"])
+            events = wh.get("events_enabled") or {"push": True, "pull_request": True, "issues": True}
             display = wh.get("display_name", "GitHub (ожидает подключения)")
 
+            # edit the existing message (so the manage button becomes the settings view)
             edit_message_text(
                 chat_id,
                 message_id,
                 f"⚙️ *Управление сервисом*\n\n{display}",
-                service_settings_keyboard(wid, enabled)
+                service_settings_keyboard(wid, events)
             )
             return {"ok": True}
 
-        # toggle: change DB flag and update only inline keyboard
-        if data.startswith("toggle:"):
-            wid = data.split(":", 1)[1]
-            res = supabase.table("webhooks").select("display_name,notifications_enabled").eq("id", wid).execute()
+        # toggle_event: flip single event type, update DB, update keyboard only
+        if data.startswith("toggle_event:"):
+            # format toggle_event:{webhook_id}:{event_key}
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                answer_callback(callback["id"])
+                return {"ok": True}
+            _, wid, event_key = parts
+            res = supabase.table("webhooks").select("events_enabled").eq("id", wid).execute()
             if not res.data:
                 send_message(chat_id, "❌ Сервис не найден.", main_keyboard())
                 return {"ok": True}
-            wh = res.data[0]
-            current = True
-            if "notifications_enabled" in wh and wh["notifications_enabled"] is not None:
-                current = bool(wh["notifications_enabled"])
-
-            new_state = not current
-            supabase.table("webhooks").update({"notifications_enabled": new_state}).eq("id", wid).execute()
-
-            # update only reply markup so the button text changes
+            events = res.data[0].get("events_enabled") or {"push": True, "pull_request": True, "issues": True}
+            # flip
+            events[event_key] = not events.get(event_key, True)
+            # update DB
+            supabase.table("webhooks").update({"events_enabled": events}).eq("id", wid).execute()
+            # update only reply markup for the same message (button state)
             edit_message_reply_markup(
                 chat_id,
                 message_id,
-                service_settings_keyboard(wid, new_state)
+                service_settings_keyboard(wid, events)
             )
             return {"ok": True}
 
-        # back to services list
+        # back to services
         if data == "back_services":
             show_services(chat_id)
             return {"ok": True}
@@ -339,7 +358,9 @@ async def telegram_update(payload: dict = Body(...)):
             "source": "github",
             "connected": False,
             "display_name": "GitHub (ожидает подключения)",
-            "notifications_enabled": True
+            # ensure default exists in DB; if not, rely on DB default
+            "notifications_enabled": True,
+            "events_enabled": {"push": True, "pull_request": True, "issues": True}
         }).execute()
 
         url = f"{BASE_URL}/webhook/github/{wh.data[0]['id']}"
@@ -358,12 +379,28 @@ async def telegram_update(payload: dict = Body(...)):
         return {"ok": True}
 
     if text == "📦 Мои сервисы":
-        show_services(chat_id)
+        user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
+        res = supabase.table("webhooks").select("id,display_name,connected").eq("user_id", user_id).execute()
+
+        if not res.data:
+            send_message(
+                chat_id,
+                "📦 У тебя пока нет сервисов.\n\n"
+                "Если есть вопросы — напиши @ligr5",
+                main_keyboard()
+            )
+            return {"ok": True}
+
+        send_message(chat_id, "📦 *Твои сервисы:*", main_keyboard())
+        for s in res.data:
+            status = "🟢" if s["connected"] else "🔴"
+            # send single manage button under each service
+            send_message(chat_id, f"{status} {s['display_name']}", service_manage_keyboard(s["id"]))
         return {"ok": True}
 
     if text == "📜 Последние уведомления":
         user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
-        evs = supabase.table("events").select("id,title").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
+        evs = supabase.table("events").select("id,title,received_at").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
 
         if not evs.data:
             send_message(
@@ -375,7 +412,8 @@ async def telegram_update(payload: dict = Body(...)):
 
         send_message(chat_id, "📜 *Последние уведомления:*", main_keyboard())
         for e in evs.data:
-            send_message(chat_id, f"🐙 {e.get('title')}", event_open_keyboard(e["id"]))
+            created_str = fmt_dt(e.get("received_at") or e.get("created_at"))
+            send_message(chat_id, f"🐙 {e.get('title')}\n\n🕒 {created_str}", event_open_keyboard(e["id"]))
         return {"ok": True}
 
     # ---------- FAQ ----------
@@ -471,9 +509,20 @@ async def github_webhook(webhook_id: str, request: Request):
     event = request.headers.get("X-GitHub-Event")
     action = payload.get("action")
 
-    wh = supabase.table("webhooks").select("user_id,notifications_enabled").eq("id", webhook_id).execute()
+    wh = supabase.table("webhooks").select("user_id,notifications_enabled,events_enabled").eq("id", webhook_id).execute()
     if not wh.data:
         return {"status": "unknown"}
+
+    # events_enabled default handling
+    events_enabled = wh.data[0].get("events_enabled") or {"push": True, "pull_request": True, "issues": True}
+
+    # фильтрация по типу события (если пользователь выключил)
+    if event == "push" and not events_enabled.get("push", True):
+        return {"status": "ignored"}
+    if event == "pull_request" and not events_enabled.get("pull_request", True):
+        return {"status": "ignored"}
+    if event == "issues" and not events_enabled.get("issues", True):
+        return {"status": "ignored"}
 
     repo = payload["repository"]["name"]
     repo_url = payload["repository"]["html_url"]
@@ -542,14 +591,25 @@ async def github_webhook(webhook_id: str, request: Request):
     # save payload and received time in memory for details
     GITHUB_EVENTS[event_id] = {"payload": payload, "created_at": received_at}
 
-    # save event to DB (include received_at field)
-    supabase.table("events").insert({
+    # save event to DB (include received_at field if present in schema)
+    # we try to insert received_at; if DB doesn't have column, remove it in fallback
+    event_record = {
         "user_id": user_id,
         "source": "github",
         "title": title,
         "data": payload,
         "received_at": received_at.isoformat()
-    }).execute()
+    }
+    try:
+        supabase.table("events").insert(event_record).execute()
+    except Exception:
+        # fallback: try without received_at (in case migration not applied)
+        try:
+            event_record.pop("received_at")
+            supabase.table("events").insert(event_record).execute()
+        except Exception:
+            # if even this fails, raise to see error in logs
+            raise
 
     # check notifications_enabled flag
     notify = True
