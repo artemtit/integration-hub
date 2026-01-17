@@ -560,4 +560,3 @@ async def github_webhook(webhook_id: str, request: Request):
         send_message(chat_id, title, github_event_keyboard(event_id, repo_url))
 
     return {"status": "ok"}
-
