@@ -73,7 +73,7 @@ def main_keyboard():
             [{"text": "➕ Подключить сервис"}],
             [{"text": "📦 Мои сервисы"}],
             [{"text": "📜 Последние уведомления"}],
-            [{"text": "ℹ️ Помощь"}]
+            [{"text": "❓ Популярные вопросы"}]
         ],
         "resize_keyboard": True
     }
@@ -81,7 +81,7 @@ def main_keyboard():
 def services_keyboard():
     return {
         "keyboard": [
-            [{"text": "GitHub"}, {"text": "Webhook (custom)"}],
+            [{"text": "GitHub"}],
             [{"text": "⬅️ Назад"}]
         ],
         "resize_keyboard": True
@@ -96,31 +96,39 @@ def confirm_keyboard():
         "resize_keyboard": True
     }
 
+def faq_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "❓ Как подключить GitHub"}],
+            [{"text": "❓ Почему сервис не подключён"}],
+            [{"text": "❓ Что означают статусы"}],
+            [{"text": "❓ Почему нет событий"}],
+            [{"text": "⬅️ Назад"}]
+        ],
+        "resize_keyboard": True
+    }
+
+def service_manage_keyboard(webhook_id: str):
+    return {
+        "inline_keyboard": [
+            [{"text": "⚙️ Управление сервисом", "callback_data": f"manage:{webhook_id}"}],
+            [{"text": "❌ Удалить", "callback_data": f"delete:{webhook_id}"}]
+        ]
+    }
+
 def github_event_keyboard(event_id: str, url: str):
     return {
         "inline_keyboard": [[
-            {"text": "📄 Подробнее", "callback_data": f"github_details:{event_id}"},
-            {"text": "🌐 Открыть на GitHub", "url": url}
+            {"text": "🌐 Открыть на GitHub", "url": url},
+            {"text": "📄 Подробнее", "callback_data": f"details:{event_id}"}
         ]]
     }
 
 def event_open_keyboard(event_id: str):
     return {
         "inline_keyboard": [[
-            {"text": "📄 Открыть событие", "callback_data": f"open_event:{event_id}"}
+            {"text": "📄 Открыть событие", "callback_data": f"open:{event_id}"}
         ]]
-    }
-
-def service_manage_keyboard(webhook_id: str):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "⚙️ Управление сервисом", "callback_data": f"manage_service:{webhook_id}"}
-            ],
-            [
-                {"text": "❌ Удалить", "callback_data": f"delete_service:{webhook_id}"}
-            ]
-        ]
     }
 
 # =========================
@@ -135,21 +143,23 @@ async def telegram_update(payload: dict = Body(...)):
         chat_id = callback["message"]["chat"]["id"]
         answer_callback(callback["id"])
 
-        # DETAILS
-        if data.startswith("github_details:"):
+        if data.startswith("details:"):
             event_id = data.split(":", 1)[1]
             ev = GITHUB_EVENTS.get(event_id)
             if not ev:
-                send_message(chat_id, "⌛ Детали устарели")
+                send_message(
+                    chat_id,
+                    "⌛ Детали устарели.\n\nЕсли есть вопросы — напиши @ligr5",
+                    main_keyboard()
+                )
                 return {"ok": True}
 
             p = ev["payload"]
             text = (
-                "📄 *GitHub — подробности*\n\n"
-                f"Repo: `{p['repository']['name']}`\n"
-                f"Branch: `{p.get('ref','').replace('refs/heads/','')}`\n"
-                f"Author: `{p['sender']['login']}`\n\n"
-                "Коммиты:\n"
+                "📄 *Подробности GitHub события*\n\n"
+                f"📦 Репозиторий:\n{p['repository']['name']}\n"
+                f"👤 Автор:\n{p['sender']['login']}\n\n"
+                "📝 Коммиты:\n"
             )
             for i, c in enumerate(p.get("commits", []), 1):
                 text += f"{i}) {c['message'].splitlines()[0]}\n"
@@ -157,43 +167,40 @@ async def telegram_update(payload: dict = Body(...)):
             send_message(chat_id, text)
             return {"ok": True}
 
-        # OPEN EVENT
-        if data.startswith("open_event:"):
+        if data.startswith("open:"):
             event_id = data.split(":", 1)[1]
-            res = supabase.table("events").select("source,title,created_at").eq("id", event_id).execute()
-            if not res.data:
-                send_message(chat_id, "❌ Событие не найдено")
+            ev = supabase.table("events").select("*").eq("id", event_id).execute()
+            if not ev.data:
+                send_message(
+                    chat_id,
+                    "❌ Событие не найдено.\n\nЕсли что-то не так — напиши @ligr5",
+                    main_keyboard()
+                )
                 return {"ok": True}
 
-            e = res.data[0]
+            e = ev.data[0]
             send_message(
                 chat_id,
                 "📄 *Событие*\n\n"
                 f"Источник: `{e['source']}`\n"
-                f"Дата: `{e['created_at'].split('T')[0]}`\n"
-                f"Описание:\n`{e['title']}`"
+                f"Дата: `{e['created_at'].split('T')[0]}`\n\n"
+                f"{e['title']}"
             )
             return {"ok": True}
 
-        # MANAGE SERVICE
-        if data.startswith("manage_service:"):
+        if data.startswith("delete:"):
+            wid = data.split(":", 1)[1]
+            PENDING_DELETE[chat_id] = wid
+            send_message(chat_id, "⚠️ Удалить этот сервис?", confirm_keyboard())
+            return {"ok": True}
+
+        if data.startswith("manage:"):
             send_message(
                 chat_id,
                 "⚙️ *Управление сервисом*\n\n"
                 "Пока доступно:\n"
                 "• ❌ Удаление сервиса",
                 main_keyboard()
-            )
-            return {"ok": True}
-
-        # DELETE SERVICE (STEP 1)
-        if data.startswith("delete_service:"):
-            webhook_id = data.split(":", 1)[1]
-            PENDING_DELETE[chat_id] = webhook_id
-            send_message(
-                chat_id,
-                "⚠️ Ты уверен, что хочешь удалить этот сервис?",
-                confirm_keyboard()
             )
             return {"ok": True}
 
@@ -207,11 +214,9 @@ async def telegram_update(payload: dict = Body(...)):
 
     supabase.table("users").upsert({"chat_id": chat_id}, on_conflict="chat_id").execute()
 
-    # DELETE CONFIRM
     if chat_id in PENDING_DELETE:
-        wid = PENDING_DELETE[chat_id]
         if text == "ДА":
-            supabase.table("webhooks").delete().eq("id", wid).execute()
+            supabase.table("webhooks").delete().eq("id", PENDING_DELETE[chat_id]).execute()
             PENDING_DELETE.pop(chat_id)
             send_message(chat_id, "✅ Сервис удалён", main_keyboard())
             return {"ok": True}
@@ -222,8 +227,7 @@ async def telegram_update(payload: dict = Body(...)):
         send_message(chat_id, "Напиши ДА или НЕТ", confirm_keyboard())
         return {"ok": True}
 
-    # START / BACK
-    if text in ("/start", "Главное меню", "⬅️ Назад"):
+    if text in ("/start", "⬅️ Назад"):
         send_message(
             chat_id,
             "👋 *Добро пожаловать в Integration Hub!*\n\n"
@@ -252,10 +256,13 @@ async def telegram_update(payload: dict = Body(...)):
         send_message(
             chat_id,
             "🔗 *Подключение GitHub*\n\n"
-            "Payload URL:\n"
+            "1️⃣ Зайди в репозиторий GitHub\n"
+            "2️⃣ Settings → Webhooks → Add webhook\n"
+            "3️⃣ Вставь Payload URL:\n"
             f"`{url}`\n\n"
-            "Content type: `application/json`\n"
-            "Event: Push",
+            "4️⃣ Content type: `application/json`\n"
+            "5️⃣ Events: Push, Pull requests, Issues\n\n"
+            "После подключения события начнут приходить сюда 👇",
             main_keyboard()
         )
         return {"ok": True}
@@ -265,42 +272,94 @@ async def telegram_update(payload: dict = Body(...)):
         res = supabase.table("webhooks").select("id,display_name,connected").eq("user_id", user_id).execute()
 
         if not res.data:
-            send_message(chat_id, "📦 У тебя пока нет сервисов", main_keyboard())
+            send_message(
+                chat_id,
+                "📦 У тебя пока нет сервисов.\n\n"
+                "Если есть вопросы — напиши @ligr5",
+                main_keyboard()
+            )
             return {"ok": True}
 
         send_message(chat_id, "📦 *Твои сервисы:*", main_keyboard())
         for s in res.data:
             status = "🟢" if s["connected"] else "🔴"
-            send_message(
-                chat_id,
-                f"{status} {s['display_name']}",
-                service_manage_keyboard(s["id"])
-            )
-        return {"ok": True}
-
-    if text == "ℹ️ Помощь":
-        send_message(
-            chat_id,
-            "ℹ️ *Помощь*\n\n"
-            "🟢 — подключён\n"
-            "🔴 — ожидает подключения\n\n"
-            "📜 Последние уведомления — история событий",
-            main_keyboard()
-        )
+            send_message(chat_id, f"{status} {s['display_name']}", service_manage_keyboard(s["id"]))
         return {"ok": True}
 
     if text == "📜 Последние уведомления":
         user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
-        evs = supabase.table("events").select("id,title,source").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
+        evs = supabase.table("events").select("id,title").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
 
         if not evs.data:
-            send_message(chat_id, "Пока нет событий", main_keyboard())
+            send_message(
+                chat_id,
+                "Пока нет событий.\n\nЕсли кажется, что что-то не работает — напиши @ligr5",
+                main_keyboard()
+            )
             return {"ok": True}
 
         send_message(chat_id, "📜 *Последние уведомления:*", main_keyboard())
         for e in evs.data:
-            icon = "🐙" if e["source"] == "github" else "🔔"
-            send_message(chat_id, f"{icon} {e['title']}", event_open_keyboard(e["id"]))
+            send_message(chat_id, f"🐙 {e['title']}", event_open_keyboard(e["id"]))
+        return {"ok": True}
+
+    # ---------- FAQ ----------
+    if text == "❓ Популярные вопросы":
+        send_message(
+            chat_id,
+            "❓ *Популярные вопросы*\n\n"
+            "Выбери вопрос ниже 👇\n\n"
+            "❓ *Не нашёл ответ?*\n"
+            "Напиши напрямую: @ligr5",
+            faq_keyboard()
+        )
+        return {"ok": True}
+
+    if text == "❓ Как подключить GitHub":
+        send_message(
+            chat_id,
+            "1️⃣ Зайди в репозиторий GitHub\n"
+            "2️⃣ Settings → Webhooks → Add webhook\n"
+            "3️⃣ Вставь Payload URL из бота\n"
+            "4️⃣ Content type: application/json\n"
+            "5️⃣ Events: Push, Pull requests, Issues\n\n"
+            "Если остались вопросы — напиши @ligr5",
+            faq_keyboard()
+        )
+        return {"ok": True}
+
+    if text == "❓ Почему сервис не подключён":
+        send_message(
+            chat_id,
+            "🔴 Статус «ожидает подключения» означает,\n"
+            "что GitHub ещё не отправил ни одного события.\n\n"
+            "Сделай любой push или GitHub сам пришлёт ping —\n"
+            "статус обновится автоматически.\n\n"
+            "Если остались вопросы — напиши @ligr5",
+            faq_keyboard()
+        )
+        return {"ok": True}
+
+    if text == "❓ Что означают статусы":
+        send_message(
+            chat_id,
+            "🟢 — сервис подключён и присылает события\n"
+            "🔴 — ожидает первого события от GitHub\n\n"
+            "Если остались вопросы — напиши @ligr5",
+            faq_keyboard()
+        )
+        return {"ok": True}
+
+    if text == "❓ Почему нет событий":
+        send_message(
+            chat_id,
+            "Если событий нет:\n"
+            "• не было push / PR / issues\n"
+            "• webhook ещё не подключён\n"
+            "• репозиторий неактивен\n\n"
+            "Если остались вопросы — напиши @ligr5",
+            faq_keyboard()
+        )
         return {"ok": True}
 
     send_message(chat_id, "Используй кнопки ниже 👇", main_keyboard())
@@ -312,42 +371,82 @@ async def telegram_update(payload: dict = Body(...)):
 @app.post("/webhook/github/{webhook_id}")
 async def github_webhook(webhook_id: str, request: Request):
     payload = await request.json()
+    event = request.headers.get("X-GitHub-Event")
+    action = payload.get("action")
 
     wh = supabase.table("webhooks").select("user_id").eq("id", webhook_id).execute()
     if not wh.data:
         return {"status": "unknown"}
 
-    repo_name = payload.get("repository", {}).get("name", "unknown")
+    repo = payload["repository"]["name"]
+    repo_url = payload["repository"]["html_url"]
+    user_id = wh.data[0]["user_id"]
+    chat_id = supabase.table("users").select("chat_id").eq("id", user_id).execute().data[0]["chat_id"]
 
     supabase.table("webhooks").update({
         "connected": True,
-        "display_name": f"GitHub ({repo_name})"
+        "display_name": f"GitHub ({repo})"
     }).eq("id", webhook_id).execute()
 
-    if request.headers.get("X-GitHub-Event") == "ping":
-        return {"status": "verified"}
+    now = "сейчас"
+    title = ""
+
+    if event == "push":
+        commits = len(payload.get("commits", []))
+        author = payload["sender"]["login"]
+        title = (
+            "🔔 GitHub · Push\n\n"
+            f"📦 Репозиторий:\n{repo}\n"
+            f"👤 Автор:\n{author}\n"
+            f"🕒 Время:\n{now}\n\n"
+            f"📝 {commits} новых коммита"
+        )
+
+    elif event == "pull_request" and action in ("opened", "closed"):
+        pr = payload["pull_request"]
+        author = pr["user"]["login"]
+        num = pr["number"]
+        msg = pr["title"]
+        state = "влит" if pr.get("merged") else "закрыт" if action == "closed" else "открыт"
+        emoji = "✅" if pr.get("merged") else "❌" if action == "closed" else "🔀"
+
+        title = (
+            f"{emoji} GitHub · Pull Request\n\n"
+            f"📦 Репозиторий:\n{repo}\n"
+            f"👤 Автор:\n{author}\n"
+            f"🕒 Время:\n{now}\n\n"
+            f"📝 PR #{num} {state}:\n{msg}"
+        )
+        repo_url = pr["html_url"]
+
+    elif event == "issues" and action in ("opened", "closed"):
+        issue = payload["issue"]
+        author = issue["user"]["login"]
+        num = issue["number"]
+        msg = issue["title"]
+        emoji = "🐞" if action == "opened" else "✅"
+
+        title = (
+            f"{emoji} GitHub · Issue\n\n"
+            f"📦 Репозиторий:\n{repo}\n"
+            f"👤 Автор:\n{author}\n"
+            f"🕒 Время:\n{now}\n\n"
+            f"📝 Issue #{num} {action}:\n{msg}"
+        )
+        repo_url = issue["html_url"]
+
+    else:
+        return {"status": "ignored"}
 
     event_id = str(uuid.uuid4())
     GITHUB_EVENTS[event_id] = {"payload": payload, "created_at": datetime.utcnow()}
 
-    user_id = wh.data[0]["user_id"]
-    chat_id = supabase.table("users").select("chat_id").eq("id", user_id).execute().data[0]["chat_id"]
-
-    repo = payload["repository"]["name"]
-    author = payload["sender"]["login"]
-    commits = len(payload.get("commits", []))
-    url = payload["repository"]["html_url"]
-
     supabase.table("events").insert({
         "user_id": user_id,
         "source": "github",
-        "title": f"GitHub push: {repo}",
+        "title": title,
         "data": payload
     }).execute()
 
-    send_message(
-        chat_id,
-        f"🔔 *GitHub push*\n\nRepo: `{repo}`\nAuthor: `{author}`\nCommits: `{commits}`",
-        github_event_keyboard(event_id, url)
-    )
+    send_message(chat_id, title, github_event_keyboard(event_id, repo_url))
     return {"status": "ok"}
