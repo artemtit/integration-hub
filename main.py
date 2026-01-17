@@ -138,21 +138,11 @@ async def telegram_update(payload: dict = Body(...)):
         return {"ok": True}
 
     # =========================
-    # CONNECT GITHUB
+    # CONNECT GITHUB (UNLIMITED)
     # =========================
     if text == "GitHub":
         user = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
         user_id = user.data[0]["id"]
-
-        existing = supabase.table("webhooks") \
-            .select("id") \
-            .eq("user_id", user_id) \
-            .eq("source", "github") \
-            .execute()
-
-        if existing.data:
-            send_message(chat_id, "⚠️ GitHub уже подключён", main_keyboard())
-            return {"ok": True}
 
         webhook = supabase.table("webhooks").insert({
             "user_id": user_id,
@@ -178,21 +168,11 @@ async def telegram_update(payload: dict = Body(...)):
         return {"ok": True}
 
     # =========================
-    # CONNECT CUSTOM
+    # CONNECT CUSTOM (UNLIMITED)
     # =========================
     if text == "Webhook (custom)":
         user = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
         user_id = user.data[0]["id"]
-
-        existing = supabase.table("webhooks") \
-            .select("id") \
-            .eq("user_id", user_id) \
-            .eq("source", "custom") \
-            .execute()
-
-        if existing.data:
-            send_message(chat_id, "⚠️ Custom webhook уже создан", main_keyboard())
-            return {"ok": True}
 
         webhook = supabase.table("webhooks").insert({
             "user_id": user_id,
