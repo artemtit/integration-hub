@@ -318,3 +318,4 @@ async def custom_webhook(webhook_id: str, payload: dict = Body(...)):
 
     send_message(chat_id, f"🔔 Custom webhook\n```{payload}```")
     return {"status": "ok"}
+
