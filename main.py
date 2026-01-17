@@ -163,9 +163,16 @@ async def telegram_update(payload: dict = Body(...)):
 
         send_message(
             chat_id,
-            f"🔗 *GitHub подключение*\n\nPayload URL:\n`{url}`",
+            "🔗 *Подключение GitHub*\n\n"
+            "1️⃣ Зайди в нужный репозиторий на GitHub\n"
+            "2️⃣ Открой **Settings → Webhooks → Add webhook**\n"
+            "3️⃣ Вставь этот URL в **Payload URL**:\n"
+            f"`{url}`\n\n"
+            "4️⃣ **Content type**: `application/json`\n"
+            "5️⃣ **Events**: `Push`\n\n"
+            "✅ После сохранения каждый коммит будет приходить в этот чат.",
             main_keyboard()
-        )
+)
         return {"ok": True}
 
     if text == "Webhook (custom)":
