@@ -1,4 +1,5 @@
 import os
+import uuid
 import requests
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Body, Request
@@ -19,9 +20,10 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
 
 # =========================
-# TEMP STATE
+# TEMP STORAGE (MVP)
 # =========================
-PENDING_DELETE = {}  # chat_id -> webhook_id
+PENDING_DELETE = {}          # chat_id -> webhook_id
+GITHUB_EVENTS = {}           # event_id -> payload
 
 # =========================
 # KEYBOARDS
@@ -54,6 +56,16 @@ def confirm_keyboard():
         "resize_keyboard": True
     }
 
+def github_event_keyboard(event_id: str, url: str):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📄 Подробнее", "callback_data": f"github_details:{event_id}"},
+                {"text": "🌐 Открыть на GitHub", "url": url}
+            ]
+        ]
+    }
+
 # =========================
 # TELEGRAM HELPER
 # =========================
@@ -80,6 +92,40 @@ async def health():
 # =========================
 @app.post("/telegram")
 async def telegram_update(payload: dict = Body(...)):
+    # ---------- CALLBACK ----------
+    callback = payload.get("callback_query")
+    if callback:
+        data = callback["data"]
+        chat_id = callback["message"]["chat"]["id"]
+
+        if data.startswith("github_details:"):
+            event_id = data.split(":", 1)[1]
+            event = GITHUB_EVENTS.get(event_id)
+
+            if not event:
+                send_message(chat_id, "❌ Детали недоступны")
+                return {"ok": True}
+
+            repo = event.get("repository", {}).get("name", "unknown")
+            branch = event.get("ref", "").replace("refs/heads/", "")
+            pusher = event.get("sender", {}).get("login", "unknown")
+
+            text = (
+                "📄 *GitHub — подробности*\n\n"
+                f"• Repo: `{repo}`\n"
+                f"• Branch: `{branch}`\n"
+                f"• Pusher: `{pusher}`\n\n"
+                "Коммиты:\n"
+            )
+
+            for i, c in enumerate(event.get("commits", []), 1):
+                msg = c.get("message", "").split("\n")[0]
+                text += f"{i}) {msg}\n"
+
+            send_message(chat_id, text)
+            return {"ok": True}
+
+    # ---------- MESSAGE ----------
     message = payload.get("message")
     if not message:
         return {"ok": True}
@@ -87,23 +133,18 @@ async def telegram_update(payload: dict = Body(...)):
     chat_id = message["chat"]["id"]
     text = message.get("text", "").strip()
 
-    # upsert user
     supabase.table("users").upsert(
         {"chat_id": chat_id},
         on_conflict="chat_id"
     ).execute()
 
-    # =========================
     # BACK
-    # =========================
     if text == "⬅️ Назад":
         PENDING_DELETE.pop(chat_id, None)
         send_message(chat_id, "🔁 Главное меню", main_keyboard())
         return {"ok": True}
 
-    # =========================
     # DELETE CONFIRM
-    # =========================
     if chat_id in PENDING_DELETE:
         webhook_id = PENDING_DELETE[chat_id]
 
@@ -121,14 +162,11 @@ async def telegram_update(payload: dict = Body(...)):
         send_message(chat_id, "Напиши **ДА** или **НЕТ**", confirm_keyboard())
         return {"ok": True}
 
-    # =========================
-    # MAIN MENU
-    # =========================
+    # START
     if text in ("/start", "Главное меню"):
         send_message(
             chat_id,
-            "👋 *Integration Hub*\n\n"
-            "Подключай сервисы и получай события в Telegram.",
+            "👋 *Integration Hub*\n\nПодключай сервисы и получай события в Telegram.",
             main_keyboard()
         )
         return {"ok": True}
@@ -137,12 +175,9 @@ async def telegram_update(payload: dict = Body(...)):
         send_message(chat_id, "Выбери сервис:", services_keyboard())
         return {"ok": True}
 
-    # =========================
-    # CONNECT GITHUB (UNLIMITED)
-    # =========================
+    # CONNECT GITHUB
     if text == "GitHub":
-        user = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
-        user_id = user.data[0]["id"]
+        user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
 
         webhook = supabase.table("webhooks").insert({
             "user_id": user_id,
@@ -150,8 +185,7 @@ async def telegram_update(payload: dict = Body(...)):
             "connected": False
         }).execute()
 
-        webhook_id = webhook.data[0]["id"]
-        url = f"{BASE_URL}/webhook/github/{webhook_id}"
+        url = f"{BASE_URL}/webhook/github/{webhook.data[0]['id']}"
 
         send_message(
             chat_id,
@@ -162,17 +196,14 @@ async def telegram_update(payload: dict = Body(...)):
             f"`{url}`\n\n"
             "4️⃣ Content type: `application/json`\n"
             "5️⃣ Events: Push\n\n"
-            "⏳ Статус появится после ping-теста",
+            "⏳ Ожидается ping",
             main_keyboard()
         )
         return {"ok": True}
 
-    # =========================
-    # CONNECT CUSTOM (UNLIMITED)
-    # =========================
+    # CONNECT CUSTOM
     if text == "Webhook (custom)":
-        user = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
-        user_id = user.data[0]["id"]
+        user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
 
         webhook = supabase.table("webhooks").insert({
             "user_id": user_id,
@@ -180,35 +211,26 @@ async def telegram_update(payload: dict = Body(...)):
             "connected": False
         }).execute()
 
-        webhook_id = webhook.data[0]["id"]
-        url = f"{BASE_URL}/webhook/custom/{webhook_id}"
+        url = f"{BASE_URL}/webhook/custom/{webhook.data[0]['id']}"
 
         send_message(
             chat_id,
             "🔔 *Custom Webhook*\n\n"
             "Отправляй POST JSON сюда:\n"
-            f"`{url}`\n\n"
-            "⏳ Статус появится после первого запроса",
+            f"`{url}`",
             main_keyboard()
         )
         return {"ok": True}
 
-    # =========================
-    # LIST SERVICES (FILTER 30 MIN)
-    # =========================
+    # LIST SERVICES
     if text == "📦 Мои сервисы":
-        user = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
-        user_id = user.data[0]["id"]
-
-        limit_time = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
+        user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
+        limit = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
 
         services = supabase.table("webhooks") \
             .select("id, source, connected, created_at") \
             .eq("user_id", user_id) \
-            .or_(
-                f"connected.eq.true,"
-                f"and(connected.eq.false,created_at.gte.{limit_time})"
-            ) \
+            .or_(f"connected.eq.true,and(connected.eq.false,created_at.gte.{limit})") \
             .execute()
 
         if not services.data:
@@ -224,25 +246,17 @@ async def telegram_update(payload: dict = Body(...)):
         send_message(chat_id, out, main_keyboard())
         return {"ok": True}
 
-    # =========================
     # DELETE STEP 1
-    # =========================
     if len(text) == 36 and "-" in text:
         PENDING_DELETE[chat_id] = text
-        send_message(
-            chat_id,
-            f"⚠️ Удалить сервис:\n`{text}` ?",
-            confirm_keyboard()
-        )
+        send_message(chat_id, f"⚠️ Удалить сервис:\n`{text}` ?", confirm_keyboard())
         return {"ok": True}
 
     if text == "ℹ️ Помощь":
         send_message(
             chat_id,
-            "ℹ️ *Помощь*\n\n"
-            "🟢 подключён\n"
-            "🔴 ожидает подключения\n\n"
-            "Сервис исчезает через 30 минут, если не был подключён",
+            "ℹ️ *Помощь*\n\n🟢 подключён\n🔴 ожидает подключения\n\n"
+            "Неподключённые исчезают через 30 минут",
             main_keyboard()
         )
         return {"ok": True}
@@ -251,36 +265,41 @@ async def telegram_update(payload: dict = Body(...)):
     return {"ok": True}
 
 # =========================
-# GITHUB WEBHOOK (PING)
+# GITHUB WEBHOOK
 # =========================
 @app.post("/webhook/github/{webhook_id}")
 async def github_webhook(webhook_id: str, request: Request):
     payload = await request.json()
     event = request.headers.get("X-GitHub-Event")
 
-    wh = supabase.table("webhooks") \
-        .select("user_id, connected") \
-        .eq("id", webhook_id) \
-        .execute()
-
+    wh = supabase.table("webhooks").select("user_id, connected").eq("id", webhook_id).execute()
     if not wh.data:
         return {"status": "unknown webhook"}
 
-    if event == "ping" or not wh.data[0]["connected"]:
-        supabase.table("webhooks") \
-            .update({"connected": True}) \
-            .eq("id", webhook_id) \
-            .execute()
+    supabase.table("webhooks").update({"connected": True}).eq("id", webhook_id).execute()
+
+    if event == "ping":
+        return {"status": "verified"}
+
+    event_id = str(uuid.uuid4())
+    GITHUB_EVENTS[event_id] = payload
 
     user_id = wh.data[0]["user_id"]
-    user = supabase.table("users").select("chat_id").eq("id", user_id).execute()
-    chat_id = user.data[0]["chat_id"]
+    chat_id = supabase.table("users").select("chat_id").eq("id", user_id).execute().data[0]["chat_id"]
 
-    if event != "ping":
-        repo = payload.get("repository", {}).get("name", "unknown")
-        author = payload.get("sender", {}).get("login", "unknown")
-        send_message(chat_id, f"🔔 GitHub\n{repo} — {author}")
+    repo = payload.get("repository", {}).get("name", "unknown")
+    author = payload.get("sender", {}).get("login", "unknown")
+    commits = len(payload.get("commits", []))
+    repo_url = payload.get("repository", {}).get("html_url", "https://github.com")
 
+    send_message(
+        chat_id,
+        f"🔔 *GitHub push*\n\n"
+        f"Repo: `{repo}`\n"
+        f"Author: `{author}`\n"
+        f"Commits: `{commits}`",
+        github_event_keyboard(event_id, repo_url)
+    )
     return {"status": "ok"}
 
 # =========================
@@ -288,23 +307,14 @@ async def github_webhook(webhook_id: str, request: Request):
 # =========================
 @app.post("/webhook/custom/{webhook_id}")
 async def custom_webhook(webhook_id: str, payload: dict = Body(...)):
-    wh = supabase.table("webhooks") \
-        .select("user_id, connected") \
-        .eq("id", webhook_id) \
-        .execute()
-
+    wh = supabase.table("webhooks").select("user_id").eq("id", webhook_id).execute()
     if not wh.data:
         return {"status": "unknown webhook"}
 
-    if not wh.data[0]["connected"]:
-        supabase.table("webhooks") \
-            .update({"connected": True}) \
-            .eq("id", webhook_id) \
-            .execute()
+    supabase.table("webhooks").update({"connected": True}).eq("id", webhook_id).execute()
 
     user_id = wh.data[0]["user_id"]
-    user = supabase.table("users").select("chat_id").eq("id", user_id).execute()
-    chat_id = user.data[0]["chat_id"]
+    chat_id = supabase.table("users").select("chat_id").eq("id", user_id).execute().data[0]["chat_id"]
 
     send_message(chat_id, f"🔔 Custom webhook\n```{payload}```")
     return {"status": "ok"}
