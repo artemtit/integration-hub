@@ -25,7 +25,7 @@ app = FastAPI()
 # TEMP STATE
 # =========================
 GITHUB_EVENTS = {}      # event_id -> {payload, created_at}
-PENDING_DELETE = {}    # chat_id -> webhook_id
+PENDING_DELETE = {}     # chat_id -> webhook_id
 TTL_HOURS = 24
 
 # =========================
@@ -40,21 +40,6 @@ def ttl_cleaner():
         time.sleep(600)
 
 threading.Thread(target=ttl_cleaner, daemon=True).start()
-
-# =========================
-# HELPERS
-# =========================
-def fmt_dt(dt):
-    """Форматирует datetime или ISO-строку в 'YYYY-MM-DD HH:MM:SS UTC'."""
-    if not dt:
-        return ""
-    if isinstance(dt, datetime):
-        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-    try:
-        # ожидаем ISO строку
-        return dt.replace("T", " ").split(".")[0] + " UTC"
-    except Exception:
-        return str(dt)
 
 # =========================
 # TELEGRAM HELPERS
@@ -149,7 +134,7 @@ def faq_keyboard():
         "resize_keyboard": True
     }
 
-# один button под сервисом
+# ---- под сервисом ТОЛЬКО ОДНА кнопка ----
 def service_manage_keyboard(webhook_id: str):
     return {
         "inline_keyboard": [
@@ -159,7 +144,7 @@ def service_manage_keyboard(webhook_id: str):
         ]
     }
 
-# настройки внутри экрана управления: toggle + delete + back
+# экран управления сервисом: toggle, delete, back
 def service_settings_keyboard(webhook_id: str, enabled: bool):
     return {
         "inline_keyboard": [
@@ -206,7 +191,7 @@ async def telegram_update(payload: dict = Body(...)):
         message_id = callback["message"]["message_id"]
         answer_callback(callback["id"])
 
-        # details (из GITHUB_EVENTS) — добавлен вывод времени из created_at
+        # details (unchanged)
         if data.startswith("details:"):
             event_id = data.split(":", 1)[1]
             ev = GITHUB_EVENTS.get(event_id)
@@ -219,12 +204,10 @@ async def telegram_update(payload: dict = Body(...)):
                 return {"ok": True}
 
             p = ev["payload"]
-            created = fmt_dt(ev.get("created_at"))
             text = (
                 "📄 *Подробности GitHub события*\n\n"
                 f"📦 Репозиторий:\n{p['repository']['name']}\n"
-                f"👤 Автор:\n{p.get('sender', {}).get('login', 'unknown')}\n"
-                f"🕒 Время прихода:\n{created}\n\n"
+                f"👤 Автор:\n{p.get('sender', {}).get('login', 'unknown')}\n\n"
                 "📝 Коммиты:\n"
             )
             for i, c in enumerate(p.get("commits", []), 1):
@@ -233,7 +216,7 @@ async def telegram_update(payload: dict = Body(...)):
             send_message(chat_id, text)
             return {"ok": True}
 
-        # open event (показываем полную дату/время created_at из БД)
+        # open event (unchanged)
         if data.startswith("open:"):
             event_id = data.split(":", 1)[1]
             ev = supabase.table("events").select("*").eq("id", event_id).execute()
@@ -246,13 +229,11 @@ async def telegram_update(payload: dict = Body(...)):
                 return {"ok": True}
 
             e = ev.data[0]
-            created_str = fmt_dt(e.get("created_at"))
             send_message(
                 chat_id,
                 "📄 *Событие*\n\n"
-                f"Источник: `{e.get('source')}`\n"
-                f"Дата и время прихода: `{created_str}`\n\n"
-                f"{e.get('title')}"
+                f"Источник: `{e['source']}`\n\n"
+                f"{e['title']}"
             )
             return {"ok": True}
 
@@ -263,10 +244,9 @@ async def telegram_update(payload: dict = Body(...)):
             send_message(chat_id, "⚠️ Удалить этот сервис?", confirm_keyboard())
             return {"ok": True}
 
-        # manage -> открываем экран настроек (редактируем сообщение)
+        # manage -> open settings (edit message to settings view)
         if data.startswith("manage:"):
             wid = data.split(":", 1)[1]
-            # get display_name and notifications_enabled (default True if missing)
             res = supabase.table("webhooks").select("display_name,notifications_enabled").eq("id", wid).execute()
             if not res.data:
                 send_message(chat_id, "❌ Сервис не найден.", main_keyboard())
@@ -277,7 +257,6 @@ async def telegram_update(payload: dict = Body(...)):
                 enabled = bool(wh["notifications_enabled"])
             display = wh.get("display_name", "GitHub (ожидает подключения)")
 
-            # edit the existing message (so the manage button becomes the settings view)
             edit_message_text(
                 chat_id,
                 message_id,
@@ -286,7 +265,7 @@ async def telegram_update(payload: dict = Body(...)):
             )
             return {"ok": True}
 
-        # toggle: change only the inline keyboard and DB flag
+        # toggle: change DB flag and update only inline keyboard
         if data.startswith("toggle:"):
             wid = data.split(":", 1)[1]
             res = supabase.table("webhooks").select("display_name,notifications_enabled").eq("id", wid).execute()
@@ -299,10 +278,9 @@ async def telegram_update(payload: dict = Body(...)):
                 current = bool(wh["notifications_enabled"])
 
             new_state = not current
-            # update DB
             supabase.table("webhooks").update({"notifications_enabled": new_state}).eq("id", wid).execute()
 
-            # change only the inline keyboard for the same message
+            # update only reply markup so the button text changes
             edit_message_reply_markup(
                 chat_id,
                 message_id,
@@ -310,7 +288,7 @@ async def telegram_update(payload: dict = Body(...)):
             )
             return {"ok": True}
 
-        # back to services
+        # back to services list
         if data == "back_services":
             show_services(chat_id)
             return {"ok": True}
@@ -361,7 +339,6 @@ async def telegram_update(payload: dict = Body(...)):
             "source": "github",
             "connected": False,
             "display_name": "GitHub (ожидает подключения)",
-            # ensure default exists in DB; if not, rely on DB default
             "notifications_enabled": True
         }).execute()
 
@@ -381,28 +358,12 @@ async def telegram_update(payload: dict = Body(...)):
         return {"ok": True}
 
     if text == "📦 Мои сервисы":
-        user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
-        res = supabase.table("webhooks").select("id,display_name,connected").eq("user_id", user_id).execute()
-
-        if not res.data:
-            send_message(
-                chat_id,
-                "📦 У тебя пока нет сервисов.\n\n"
-                "Если есть вопросы — напиши @ligr5",
-                main_keyboard()
-            )
-            return {"ok": True}
-
-        send_message(chat_id, "📦 *Твои сервисы:*", main_keyboard())
-        for s in res.data:
-            status = "🟢" if s["connected"] else "🔴"
-            # send single manage button under each service
-            send_message(chat_id, f"{status} {s['display_name']}", service_manage_keyboard(s["id"]))
+        show_services(chat_id)
         return {"ok": True}
 
     if text == "📜 Последние уведомления":
         user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
-        evs = supabase.table("events").select("id,title,created_at").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
+        evs = supabase.table("events").select("id,title").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
 
         if not evs.data:
             send_message(
@@ -414,9 +375,7 @@ async def telegram_update(payload: dict = Body(...)):
 
         send_message(chat_id, "📜 *Последние уведомления:*", main_keyboard())
         for e in evs.data:
-            # show title already contains the time, but ensure created_at is visible — include created_at in the list preview
-            created_str = fmt_dt(e.get("created_at"))
-            send_message(chat_id, f"🐙 {e.get('title')}\n\n🕒 {created_str}", event_open_keyboard(e["id"]))
+            send_message(chat_id, f"🐙 {e.get('title')}", event_open_keyboard(e["id"]))
         return {"ok": True}
 
     # ---------- FAQ ----------
@@ -482,7 +441,7 @@ async def telegram_update(payload: dict = Body(...)):
     return {"ok": True}
 
 # =========================
-# HELPERS (повторно для доступности)
+# HELPERS
 # =========================
 def show_services(chat_id):
     user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
@@ -527,14 +486,14 @@ async def github_webhook(webhook_id: str, request: Request):
         "display_name": f"GitHub ({repo})"
     }).eq("id", webhook_id).execute()
 
-    # точное время прихода события
+    # точное время прихода события в формате DD.MM.YYYY HH:MM:SS UTC
     received_at = datetime.utcnow()
-    received_str = fmt_dt(received_at)
+    received_str = received_at.strftime("%d.%m.%Y %H:%M:%S UTC")
 
     title = ""
     if event == "push":
         commits = len(payload.get("commits", []))
-        author = payload["sender"]["login"]
+        author = payload.get("sender", {}).get("login", "unknown")
         title = (
             "🔔 GitHub · Push\n\n"
             f"📦 Репозиторий:\n{repo}\n"
@@ -544,10 +503,10 @@ async def github_webhook(webhook_id: str, request: Request):
         )
 
     elif event == "pull_request" and action in ("opened", "closed"):
-        pr = payload["pull_request"]
-        author = pr["user"]["login"]
-        num = pr["number"]
-        msg = pr["title"]
+        pr = payload.get("pull_request", {})
+        author = pr.get("user", {}).get("login", "unknown")
+        num = pr.get("number")
+        msg = pr.get("title", "")
         state = "влит" if pr.get("merged") else "закрыт" if action == "closed" else "открыт"
         emoji = "✅" if pr.get("merged") else "❌" if action == "closed" else "🔀"
 
@@ -558,13 +517,13 @@ async def github_webhook(webhook_id: str, request: Request):
             f"🕒 Время:\n{received_str}\n\n"
             f"📝 PR #{num} {state}:\n{msg}"
         )
-        repo_url = pr["html_url"]
+        repo_url = pr.get("html_url", repo_url)
 
     elif event == "issues" and action in ("opened", "closed"):
-        issue = payload["issue"]
-        author = issue["user"]["login"]
-        num = issue["number"]
-        msg = issue["title"]
+        issue = payload.get("issue", {})
+        author = issue.get("user", {}).get("login", "unknown")
+        num = issue.get("number")
+        msg = issue.get("title", "")
         emoji = "🐞" if action == "opened" else "✅"
 
         title = (
@@ -574,25 +533,25 @@ async def github_webhook(webhook_id: str, request: Request):
             f"🕒 Время:\n{received_str}\n\n"
             f"📝 Issue #{num} {action}:\n{msg}"
         )
-        repo_url = issue["html_url"]
+        repo_url = issue.get("html_url", repo_url)
 
     else:
         return {"status": "ignored"}
 
     event_id = str(uuid.uuid4())
-    # сохраняем payload и время прихода в оперативной памяти для деталей
+    # save payload and received time in memory for details
     GITHUB_EVENTS[event_id] = {"payload": payload, "created_at": received_at}
 
-    # сохраняем событие в БД и явно передаём received_at (если нужно, будет в created_at тоже)
+    # save event to DB (include received_at field)
     supabase.table("events").insert({
         "user_id": user_id,
         "source": "github",
         "title": title,
         "data": payload,
-        "received_at": received_at.isoformat()  # опционально, удобно для поиска/фильтров
+        "received_at": received_at.isoformat()
     }).execute()
 
-    # отправляем только если включены уведомления
+    # check notifications_enabled flag
     notify = True
     if "notifications_enabled" in wh.data[0]:
         notify = bool(wh.data[0]["notifications_enabled"])
