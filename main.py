@@ -22,13 +22,11 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
 
 # =========================
-# CONFIG
+# TEMP STATE
 # =========================
 GITHUB_EVENTS = {}      # event_id -> {payload, created_at}
 PENDING_DELETE = {}     # chat_id -> webhook_id
 TTL_HOURS = 24
-
-NOTIF_PAGE_SIZE = 3     # показываем по 3 уведомления
 
 # =========================
 # TTL CLEANER
@@ -47,44 +45,35 @@ threading.Thread(target=ttl_cleaner, daemon=True).start()
 # HELPERS
 # =========================
 def fmt_dt(dt):
-    """Форматирует datetime или ISO-строку в 'DD.MM.YYYY HH:MM UTC' (без секунд)."""
+    """Форматирует datetime или ISO-строку в 'DD.MM.YYYY HH:MM:SS UTC'."""
     if not dt:
         return ""
     if isinstance(dt, datetime):
-        return dt.strftime("%d.%m.%Y %H:%M UTC")
+        return dt.strftime("%d.%m.%Y %H:%M:%S UTC")
     try:
-        # ожидаем ISO строку: 2026-01-17T12:34:56...
-        base = dt.replace("T", " ").split(".")[0]  # "YYYY-MM-DD HH:MM:SS"
-        # обрежем секунды
-        parts = base.split(" ")
-        if len(parts) >= 2:
-            date = parts[0]
-            time_hm = ":".join(parts[1].split(":")[:2])
-            return f"{datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m.%Y')} {time_hm} UTC"
-        return base + " UTC"
+        return dt.replace("T", " ").split(".")[0] + " UTC"
     except Exception:
         return str(dt)
 
-def strip_time_from_title(title: str) -> str:
-    """
-    Убирает блок:
-    "\n🕒 Время:\n{...}\n\n"
-    если он присутствует в title, чтобы в списке не дублировать время.
-    """
-    if not title:
-        return title
-    marker = "\n🕒 Время:\n"
-    idx = title.find(marker)
-    if idx == -1:
-        return title
-    # найти следующее двойное переведение строки после marker
-    start = idx
-    after = title.find("\n\n", start)
-    if after == -1:
-        # нет двойного переноса — удаляем до конца
-        return title[:start]
-    # удаляем участок [start: after+2]
-    return title[:start] + title[after+2:]
+def join_enabled(events_dict):
+    """Возвращает строку видов событий, включённых для сервиса."""
+    mapping = [("push", "Push"), ("pull_request", "PR"), ("issues", "Issues")]
+    parts = [name for key, name in mapping if events_dict.get(key, True)]
+    return ", ".join(parts) if parts else "ничего"
+
+def build_event_text(kind_title: str, repo: str, author: str, received_str: str, body_lines: list[str]):
+    """Единый шаблон сообщения для событий."""
+    sep = "────────────────"
+    text = f"{kind_title}\n{sep}\n\n"
+    text += f"📦 Репозиторий:\n`{repo}`\n\n"
+    text += f"👤 Автор:\n`{author}`\n\n"
+    text += f"🕒 Время:\n`{received_str}`\n\n"
+    if body_lines:
+        text += "📝 Детали:\n"
+        for l in body_lines:
+            # bullet each
+            text += f"• {l}\n"
+    return text
 
 # =========================
 # TELEGRAM HELPERS
@@ -97,11 +86,7 @@ def send_message(chat_id: int, text: str, keyboard: dict | None = None):
     }
     if keyboard:
         payload["reply_markup"] = keyboard
-
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json=payload
-    )
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
 
 def edit_message_text(chat_id: int, message_id: int, text: str, keyboard: dict | None = None):
     payload = {
@@ -112,34 +97,16 @@ def edit_message_text(chat_id: int, message_id: int, text: str, keyboard: dict |
     }
     if keyboard:
         payload["reply_markup"] = keyboard
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
-        json=payload
-    )
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json=payload)
 
 def edit_message_reply_markup(chat_id: int, message_id: int, keyboard: dict | None = None):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id
-    }
+    payload = {"chat_id": chat_id, "message_id": message_id}
     if keyboard:
         payload["reply_markup"] = keyboard
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageReplyMarkup",
-        json=payload
-    )
-
-def delete_message(chat_id: int, message_id: int):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
-        json={"chat_id": chat_id, "message_id": message_id}
-    )
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageReplyMarkup", json=payload)
 
 def answer_callback(callback_id: str):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
-        json={"callback_query_id": callback_id}
-    )
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id})
 
 # =========================
 # KEYBOARDS
@@ -186,50 +153,27 @@ def faq_keyboard():
     }
 
 def service_manage_keyboard(webhook_id: str):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "⚙️ Управление сервисом", "callback_data": f"manage:{webhook_id}"}
-            ]
-        ]
-    }
+    return {"inline_keyboard": [[{"text": "⚙️ Управление сервисом", "callback_data": f"manage:{webhook_id}"}]]}
 
 def service_settings_keyboard(webhook_id: str, events: dict):
     def btn(label, key):
         emoji = "✅" if events.get(key, True) else "❌"
         return {"text": f"{emoji} {label}", "callback_data": f"toggle_event:{webhook_id}:{key}"}
-
     return {
         "inline_keyboard": [
             [btn("Push", "push")],
             [btn("Pull Requests", "pull_request")],
             [btn("Issues", "issues")],
             [{"text": "❌ Удалить сервис", "callback_data": f"delete:{webhook_id}"}],
-            [{"text": "⬅️ Назад", "callback_data": f"back:{webhook_id}"}]
+            [{"text": "⬅️ Назад", "callback_data": "back_services"}]
         ]
     }
 
 def github_event_keyboard(event_id: str, url: str):
-    return {
-        "inline_keyboard": [[
-            {"text": "🌐 Открыть на GitHub", "url": url},
-            {"text": "📄 Подробнее", "callback_data": f"details:{event_id}"}
-        ]]
-    }
+    return {"inline_keyboard": [[{"text": "🌐 Открыть на GitHub", "url": url}, {"text": "📄 Подробнее", "callback_data": f"details:{event_id}"}]]}
 
 def event_open_keyboard(event_id: str):
-    return {
-        "inline_keyboard": [[
-            {"text": "📄 Открыть событие", "callback_data": f"open:{event_id}"}
-        ]]
-    }
-
-def load_more_keyboard(next_offset: int):
-    return {
-        "inline_keyboard": [
-            [{"text": "Загрузить ещё 3", "callback_data": f"load_more:{next_offset}"}]
-        ]
-    }
+    return {"inline_keyboard": [[{"text": "📄 Открыть событие", "callback_data": f"open:{event_id}"}]]}
 
 # =========================
 # TELEGRAM WEBHOOK
@@ -243,30 +187,24 @@ async def telegram_update(payload: dict = Body(...)):
         message_id = callback["message"]["message_id"]
         answer_callback(callback["id"])
 
-        # --- details ---
+        # details (из памяти GITHUB_EVENTS) — одинаковый шаблон
         if data.startswith("details:"):
             event_id = data.split(":", 1)[1]
             ev = GITHUB_EVENTS.get(event_id)
             if not ev:
                 send_message(chat_id, "⌛ Детали устарели.\n\nЕсли есть вопросы — напиши @ligr5", main_keyboard())
                 return {"ok": True}
-
             p = ev["payload"]
             created = fmt_dt(ev.get("created_at"))
-            text = (
-                "📄 *Подробности GitHub события*\n\n"
-                f"📦 Репозиторий:\n{p['repository']['name']}\n"
-                f"👤 Автор:\n{p.get('sender', {}).get('login', 'unknown')}\n"
-                f"🕒 Время прихода:\n{created}\n\n"
-                "📝 Коммиты:\n"
-            )
-            for i, c in enumerate(p.get("commits", []), 1):
-                text += f"{i}) {c['message'].splitlines()[0]}\n"
-
+            # build body lines depending on event structure
+            body_lines = []
+            for c in p.get("commits", []):
+                body_lines.append(c.get("message", "").splitlines()[0])
+            text = build_event_text("📄 GitHub · Подробности", p["repository"]["name"], p.get("sender", {}).get("login", "unknown"), created, body_lines)
             send_message(chat_id, text)
             return {"ok": True}
 
-        # --- open event ---
+        # open event (из БД) — показываем unified view
         if data.startswith("open:"):
             event_id = data.split(":", 1)[1]
             ev = supabase.table("events").select("*").eq("id", event_id).execute()
@@ -275,24 +213,38 @@ async def telegram_update(payload: dict = Body(...)):
                 return {"ok": True}
             e = ev.data[0]
             created_str = fmt_dt(e.get("received_at") or e.get("created_at"))
-            send_message(chat_id,
-                         "📄 *Событие*\n\n"
-                         f"Источник: `{e.get('source')}`\n"
-                         f"Дата и время прихода: `{created_str}`\n\n"
-                         f"{e.get('title')}")
+            # for stored events we already have title text — try to extract short details or show title
+            # use title's last lines or data
+            body_lines = []
+            # try to collect small summary from data if possible
+            try:
+                payload = e.get("data") or {}
+                if "commits" in payload:
+                    for c in payload.get("commits", []):
+                        body_lines.append(c.get("message", "").splitlines()[0])
+                elif "pull_request" in payload:
+                    pr = payload.get("pull_request", {})
+                    body_lines.append(pr.get("title", "PR"))
+                elif "issue" in payload:
+                    issue = payload.get("issue", {})
+                    body_lines.append(issue.get("title", "Issue"))
+            except Exception:
+                pass
+            text = build_event_text("📄 Сохранённое событие", e.get("title", "Событие"), e.get("source", "github"), created_str, body_lines)
+            send_message(chat_id, text)
             return {"ok": True}
 
-        # --- delete flow ---
+        # delete inline -> confirm
         if data.startswith("delete:"):
             wid = data.split(":", 1)[1]
             PENDING_DELETE[chat_id] = wid
             send_message(chat_id, "⚠️ Удалить этот сервис?", confirm_keyboard())
             return {"ok": True}
 
-        # --- manage settings ---
+        # manage -> open settings (edit message to settings view)
         if data.startswith("manage:"):
             wid = data.split(":", 1)[1]
-            res = supabase.table("webhooks").select("display_name,events_enabled,connected").eq("id", wid).execute()
+            res = supabase.table("webhooks").select("display_name,events_enabled").eq("id", wid).execute()
             if not res.data:
                 send_message(chat_id, "❌ Сервис не найден.", main_keyboard())
                 return {"ok": True}
@@ -302,10 +254,11 @@ async def telegram_update(payload: dict = Body(...)):
             edit_message_text(chat_id, message_id, f"⚙️ *Управление сервисом*\n\n{display}", service_settings_keyboard(wid, events))
             return {"ok": True}
 
-        # --- toggle single event type ---
+        # toggle_event: flip single event type, update DB, update keyboard only
         if data.startswith("toggle_event:"):
             parts = data.split(":", 2)
             if len(parts) != 3:
+                answer_callback(callback["id"])
                 return {"ok": True}
             _, wid, event_key = parts
             res = supabase.table("webhooks").select("events_enabled").eq("id", wid).execute()
@@ -315,78 +268,21 @@ async def telegram_update(payload: dict = Body(...)):
             events = res.data[0].get("events_enabled") or {"push": True, "pull_request": True, "issues": True}
             events[event_key] = not events.get(event_key, True)
             supabase.table("webhooks").update({"events_enabled": events}).eq("id", wid).execute()
+            # refresh keyboard only
             edit_message_reply_markup(chat_id, message_id, service_settings_keyboard(wid, events))
             return {"ok": True}
 
-        # --- back: restore the SAME message to original service entry (no re-list) ---
-        if data.startswith("back:"):
-            wid = data.split(":", 1)[1]
-            res = supabase.table("webhooks").select("display_name,connected").eq("id", wid).execute()
-            if not res.data:
-                send_message(chat_id, "❌ Сервис не найден.", main_keyboard())
-                return {"ok": True}
-            wh = res.data[0]
-            display = wh.get("display_name", "GitHub (ожидает подключения)")
-            status = "🟢" if wh.get("connected") else "🔴"
-            edit_message_text(chat_id, message_id, f"{status} {display}", service_manage_keyboard(wid))
-            return {"ok": True}
-
-        # --- load more notifications ---
-        if data.startswith("load_more:"):
-            # format: load_more:{offset}
-            try:
-                offset = int(data.split(":", 1)[1])
-            except Exception:
-                offset = 0
-            # удаляем кнопку (это то сообщение с кнопкой)
-            try:
-                delete_message(chat_id, message_id)
-            except Exception:
-                pass  # не критично
-
-            # получаем user_id по chat_id
-            user_res = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
-            if not user_res.data:
-                send_message(chat_id, "❌ Пользователь не найден.", main_keyboard())
-                return {"ok": True}
-            user_id = user_res.data[0]["id"]
-
-            # достаём следующие N уведомлений с offset
-            start = offset
-            end = offset + NOTIF_PAGE_SIZE - 1
-            evs = supabase.table("events") \
-                .select("id,title,received_at") \
-                .eq("user_id", user_id) \
-                .order("created_at", desc=True) \
-                .range(start, end) \
-                .execute()
-
-            if not evs.data:
-                send_message(chat_id, "Пока нет дополнительных уведомлений.", main_keyboard())
-                return {"ok": True}
-
-            for e in evs.data:
-                # в preview не дублируем время — убираем секцию времени из title, если есть
-                preview = strip_time_from_title(e.get("title", ""))
-                created_str = fmt_dt(e.get("received_at") or e.get("created_at"))
-                # НЕ добавляем отдельно время внизу, поскольку время уже присутствует в preview (если нужно) —
-                # но пользователь просил не дублировать: поэтому показываем просто preview
-                send_message(chat_id, f"🐙 {preview}", event_open_keyboard(e["id"]))
-
-            # если пришло ровно page_size — возможно есть ещё — отправим кнопку с новым offset
-            if len(evs.data) == NOTIF_PAGE_SIZE:
-                new_offset = offset + NOTIF_PAGE_SIZE
-                send_message(chat_id, "Загрузить ещё:", load_more_keyboard(new_offset))
+        # inline back -> just show services (no extra message)
+        if data == "back_services":
+            show_services(chat_id)
             return {"ok": True}
 
     # ---------- MESSAGE ----------
     message = payload.get("message")
     if not message:
         return {"ok": True}
-
     chat_id = message["chat"]["id"]
     text = message.get("text", "").strip()
-
     supabase.table("users").upsert({"chat_id": chat_id}, on_conflict="chat_id").execute()
 
     if chat_id in PENDING_DELETE:
@@ -402,14 +298,20 @@ async def telegram_update(payload: dict = Body(...)):
         send_message(chat_id, "Напиши ДА или НЕТ", confirm_keyboard())
         return {"ok": True}
 
-    if text in ("/start", "⬅️ Назад"):
+    # text-button back: show short message then main menu (except inline back inside manage)
+    if text == "/start":
+        # mini-onboarding first time could be added, keep simple welcome
         send_message(chat_id,
-                     "👋 *Добро пожаловать в Integration Hub!*\n\n"
-                     "Я помогу получать события из GitHub и других сервисов прямо в Telegram.\n\n"
-                     "🔹 Подключай сервисы\n"
-                     "🔹 Получай уведомления\n"
-                     "🔹 Управляй всем из одного бота",
-                     main_keyboard())
+            "👋 *Добро пожаловать в Integration Hub!*\n\n"
+            "Я помогу получать события из GitHub и других сервисов прямо в Telegram.\n\n"
+            "🔹 Подключай сервисы\n"
+            "🔹 Выбирай типы событий\n"
+            "🔹 Получай аккуратные уведомления",
+            main_keyboard()
+        )
+        return {"ok": True}
+    if text == "⬅️ Назад":
+        send_message(chat_id, "⬅️ Возвращаю в главное меню.", main_keyboard())
         return {"ok": True}
 
     if text == "➕ Подключить сервис":
@@ -417,7 +319,13 @@ async def telegram_update(payload: dict = Body(...)):
         return {"ok": True}
 
     if text == "GitHub":
-        user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
+        # create webhook record with sensible defaults
+        user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
+        if not user_row.data:
+            # ensure user exists
+            supabase.table("users").insert({"chat_id": chat_id}).execute()
+            user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
+        user_id = user_row.data[0]["id"]
         wh = supabase.table("webhooks").insert({
             "user_id": user_id,
             "source": "github",
@@ -426,18 +334,18 @@ async def telegram_update(payload: dict = Body(...)):
             "notifications_enabled": True,
             "events_enabled": {"push": True, "pull_request": True, "issues": True}
         }).execute()
-
         url = f"{BASE_URL}/webhook/github/{wh.data[0]['id']}"
         send_message(chat_id,
-                     "🔗 *Подключение GitHub*\n\n"
-                     "1️⃣ Зайди в репозиторий GitHub\n"
-                     "2️⃣ Settings → Webhooks → Add webhook\n"
-                     "3️⃣ Вставь Payload URL:\n"
-                     f"`{url}`\n\n"
-                     "4️⃣ Content type: `application/json`\n"
-                     "5️⃣ Events: Push, Pull requests, Issues\n\n"
-                     "После подключения события начнут приходить сюда 👇",
-                     main_keyboard())
+            "🔗 *Подключение GitHub*\n\n"
+            "1️⃣ Зайди в репозиторий GitHub\n"
+            "2️⃣ Settings → Webhooks → Add webhook\n"
+            "3️⃣ Вставь Payload URL:\n"
+            f"`{url}`\n\n"
+            "4️⃣ Content type: `application/json`\n"
+            "5️⃣ Events: Push, Pull requests, Issues\n\n"
+            "После подключения события начнут приходить сюда 👇",
+            main_keyboard()
+        )
         return {"ok": True}
 
     if text == "📦 Мои сервисы":
@@ -445,100 +353,100 @@ async def telegram_update(payload: dict = Body(...)):
         return {"ok": True}
 
     if text == "📜 Последние уведомления":
-        # показываем первые NOTIF_PAGE_SIZE уведомлений (offset = 0)
-        user_res = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
-        if not user_res.data:
-            send_message(chat_id, "❌ Пользователь не найден.", main_keyboard())
+        user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
+        if not user_row.data:
+            send_message(chat_id, "📜 Пока нет событий — сначала подключи сервис (➕ Подключить сервис).", main_keyboard())
             return {"ok": True}
-        user_id = user_res.data[0]["id"]
-
-        evs = supabase.table("events") \
-            .select("id,title,received_at") \
-            .eq("user_id", user_id) \
-            .order("created_at", desc=True) \
-            .range(0, NOTIF_PAGE_SIZE - 1) \
-            .execute()
-
+        user_id = user_row.data[0]["id"]
+        evs = supabase.table("events").select("id,title,received_at,created_at").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
         if not evs.data:
-            send_message(chat_id, "Пока нет событий.\n\nЕсли кажется, что что-то не работает — напиши @ligr5", main_keyboard())
+            send_message(chat_id, "📜 Пока нет событий.\nСделай push в репозиторий, чтобы получить первое уведомление.", main_keyboard())
             return {"ok": True}
-
         send_message(chat_id, "📜 *Последние уведомления:*", main_keyboard())
         for e in evs.data:
-            preview = strip_time_from_title(e.get("title", ""))
-            # НЕ добавляем время снизу (чтобы не дублировать)
-            send_message(chat_id, f"🐙 {preview}", event_open_keyboard(e["id"]))
-
-        # если их ровно page_size — возможно есть ещё — отправляем кнопку load_more:3
-        if len(evs.data) == NOTIF_PAGE_SIZE:
-            send_message(chat_id, "Загрузить ещё:", load_more_keyboard(NOTIF_PAGE_SIZE))
+            created_str = fmt_dt(e.get("received_at") or e.get("created_at"))
+            # build short preview: take first line from title
+            preview = e.get("title", "").splitlines()[0]
+            send_message(chat_id, f"{preview}\n\n🕒 {created_str}", event_open_keyboard(e["id"]))
         return {"ok": True}
 
     # ---------- FAQ ----------
     if text == "❓ Популярные вопросы":
         send_message(chat_id,
-                     "❓ *Популярные вопросы*\n\n"
-                     "Выбери вопрос ниже 👇\n\n"
-                     "❓ *Не нашёл ответ?*\n"
-                     "Напиши напрямую: @ligr5",
-                     faq_keyboard())
+            "❓ *Популярные вопросы*\n\n"
+            "Выбери вопрос ниже 👇\n\n"
+            "❓ *Не нашёл ответ?*\n"
+            "Напиши напрямую: @ligr5",
+            faq_keyboard()
+        )
         return {"ok": True}
 
     if text == "❓ Как подключить GitHub":
         send_message(chat_id,
-                     "1️⃣ Зайди в репозиторий GitHub\n"
-                     "2️⃣ Settings → Webhooks → Add webhook\n"
-                     "3️⃣ Вставь Payload URL из бота\n"
-                     "4️⃣ Content type: application/json\n"
-                     "5️⃣ Events: Push, Pull requests, Issues\n\n"
-                     "Если остались вопросы — напиши @ligr5",
-                     faq_keyboard())
+            "1️⃣ Зайди в репозиторий GitHub\n"
+            "2️⃣ Settings → Webhooks → Add webhook\n"
+            "3️⃣ Вставь Payload URL из бота\n"
+            "4️⃣ Content type: application/json\n"
+            "5️⃣ Events: Push, Pull requests, Issues\n\n"
+            "Если остались вопросы — напиши @ligr5",
+            faq_keyboard()
+        )
         return {"ok": True}
 
     if text == "❓ Почему сервис не подключён":
         send_message(chat_id,
-                     "🔴 Статус «ожидает подключения» означает,\n"
-                     "что GitHub ещё не отправил ни одного события.\n\n"
-                     "Сделай любой push или GitHub сам пришлёт ping —\n"
-                     "статус обновится автоматически.\n\n"
-                     "Если остались вопросы — напиши @ligr5",
-                     faq_keyboard())
+            "🔴 Статус «ожидает подключения» означает, что GitHub ещё не отправил ни одного события.\n\n"
+            "Сделай любой push или GitHub сам пришлёт ping — статус обновится автоматически.\n\n"
+            "Если остались вопросы — напиши @ligr5",
+            faq_keyboard()
+        )
         return {"ok": True}
 
     if text == "❓ Что означают статусы":
         send_message(chat_id,
-                     "🟢 — сервис подключён и присылает события\n"
-                     "🔴 — ожидает первого события от GitHub\n\n"
-                     "Если остались вопросы — напиши @ligr5",
-                     faq_keyboard())
+            "🟢 — сервис подключён и присылает события\n"
+            "🔴 — ожидает первого события от GitHub\n\n"
+            "Если остались вопросы — напиши @ligr5",
+            faq_keyboard()
+        )
         return {"ok": True}
 
     if text == "❓ Почему нет событий":
         send_message(chat_id,
-                     "Если событий нет:\n"
-                     "• не было push / PR / issues\n"
-                     "• webhook ещё не подключён\n"
-                     "• репозиторий неактивен\n\n"
-                     "Если остались вопросы — напиши @ligr5",
-                     faq_keyboard())
+            "Если событий нет:\n"
+            "• не было push / PR / issues\n"
+            "• webhook ещё не подключён\n"
+            "• репозиторий неактивен\n\n"
+            "Если остались вопросы — напиши @ligr5",
+            faq_keyboard()
+        )
         return {"ok": True}
 
     send_message(chat_id, "Используй кнопки ниже 👇", main_keyboard())
     return {"ok": True}
 
+
 # =========================
 # HELPERS
 # =========================
 def show_services(chat_id):
-    user_id = supabase.table("users").select("id").eq("chat_id", chat_id).execute().data[0]["id"]
-    services = supabase.table("webhooks").select("id,display_name,connected").eq("user_id", user_id).execute().data
+    user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
+    if not user_row.data:
+        send_message(chat_id, "📦 У тебя пока нет сервисов.\n\nНажми «➕ Подключить сервис», чтобы начать.", main_keyboard())
+        return
+    user_id = user_row.data[0]["id"]
+    services = supabase.table("webhooks").select("id,display_name,connected,events_enabled").eq("user_id", user_id).execute().data
     if not services:
-        send_message(chat_id, "📦 У тебя пока нет сервисов.\n\nНапиши @ligr5", main_keyboard())
+        send_message(chat_id, "📦 У тебя пока нет сервисов.\n\nНажми «➕ Подключить сервис», чтобы начать.", main_keyboard())
         return
     send_message(chat_id, "📦 *Твои сервисы:*", main_keyboard())
     for s in services:
-        status = "🟢" if s["connected"] else "🔴"
-        send_message(chat_id, f"{status} {s['display_name']}", service_manage_keyboard(s["id"]))
+        status_emo = "🟢" if s.get("connected") else "🔴"
+        events = s.get("events_enabled") or {"push": True, "pull_request": True, "issues": True}
+        enabled_list = join_enabled(events)
+        # First line: status + display_name. Second line: concise status string
+        send_message(chat_id, f"{status_emo} {s.get('display_name')}\n`{ 'Подключён' if s.get('connected') else 'Ожидает подключения' } · {enabled_list}`", service_manage_keyboard(s["id"]))
+
 
 # =========================
 # GITHUB WEBHOOK
@@ -549,13 +457,15 @@ async def github_webhook(webhook_id: str, request: Request):
     event = request.headers.get("X-GitHub-Event")
     action = payload.get("action")
 
-    wh = supabase.table("webhooks").select("user_id,notifications_enabled,events_enabled").eq("id", webhook_id).execute()
-    if not wh.data:
+    # fetch webhook record including connected / events_enabled
+    wh_res = supabase.table("webhooks").select("user_id,connected,notifications_enabled,events_enabled").eq("id", webhook_id).execute()
+    if not wh_res.data:
         return {"status": "unknown"}
+    wh_row = wh_res.data[0]
+    prev_connected = bool(wh_row.get("connected", False))
+    events_enabled = wh_row.get("events_enabled") or {"push": True, "pull_request": True, "issues": True}
 
-    events_enabled = wh.data[0].get("events_enabled") or {"push": True, "pull_request": True, "issues": True}
-
-    # фильтрация по типу события (если пользователь выключил)
+    # filtering by user choices
     if event == "push" and not events_enabled.get("push", True):
         return {"status": "ignored"}
     if event == "pull_request" and not events_enabled.get("pull_request", True):
@@ -565,77 +475,61 @@ async def github_webhook(webhook_id: str, request: Request):
 
     repo = payload["repository"]["name"]
     repo_url = payload["repository"]["html_url"]
-    user_id = wh.data[0]["user_id"]
+    user_id = wh_row["user_id"]
     chat_id = supabase.table("users").select("chat_id").eq("id", user_id).execute().data[0]["chat_id"]
 
+    # Update display name and connected flag (if not connected yet)
     supabase.table("webhooks").update({
         "connected": True,
         "display_name": f"GitHub ({repo})"
     }).eq("id", webhook_id).execute()
 
-    # точное время прихода события в формате DD.MM.YYYY HH:MM UTC (без секунд)
-    received_at = datetime.utcnow()
-    received_str = received_at.strftime("%d.%m.%Y %H:%M UTC")
+    # first-time connected welcome
+    if not prev_connected:
+        send_message(chat_id,
+            f"🎉 *GitHub подключён!*\n\n`{repo}` теперь будет присылать события сюда.\n\n"
+            "Если хочешь — открой управление сервиса и выбери, какие события тебе нужны (Push / PR / Issues)."
+        )
 
+    # time
+    received_at = datetime.utcnow()
+    received_str = received_at.strftime("%d.%m.%Y %H:%M:%S UTC")
+
+    # build unified title/text for notification
     title = ""
+    body_lines = []
     if event == "push":
         commits = len(payload.get("commits", []))
         author = payload.get("sender", {}).get("login", "unknown")
-        title = (
-            "🔔 GitHub · Push\n\n"
-            f"📦 Репозиторий:\n{repo}\n"
-            f"👤 Автор:\n{author}\n"
-            f"🕒 Время:\n{received_str}\n\n"
-            f"📝 {commits} новых коммита"
-        )
-
+        for c in payload.get("commits", []):
+            body_lines.append(c.get("message", "").splitlines()[0])
+        kind_title = f"🔔 GitHub · Push"
+        title = f"{kind_title}\n\n📦 {repo} — {commits} commits"
     elif event == "pull_request" and action in ("opened", "closed"):
         pr = payload.get("pull_request", {})
         author = pr.get("user", {}).get("login", "unknown")
         num = pr.get("number")
         msg = pr.get("title", "")
-        state = "влит" if pr.get("merged") else "закрыт" if action == "closed" else "открыт"
-        emoji = "✅" if pr.get("merged") else "❌" if action == "closed" else "🔀"
-
-        title = (
-            f"{emoji} GitHub · Pull Request\n\n"
-            f"📦 Репозиторий:\n{repo}\n"
-            f"👤 Автор:\n{author}\n"
-            f"🕒 Время:\n{received_str}\n\n"
-            f"📝 PR #{num} {state}:\n{msg}"
-        )
-        repo_url = pr.get("html_url", repo_url)
-
+        state = "merged" if pr.get("merged") else ("closed" if action == "closed" else "opened")
+        body_lines = [f"PR #{num} {state}: {msg}"]
+        kind_title = "🔀 GitHub · Pull Request"
+        title = f"{kind_title}\n\n📦 {repo} · PR #{num} {state}"
     elif event == "issues" and action in ("opened", "closed"):
         issue = payload.get("issue", {})
         author = issue.get("user", {}).get("login", "unknown")
         num = issue.get("number")
         msg = issue.get("title", "")
-        emoji = "🐞" if action == "opened" else "✅"
-
-        title = (
-            f"{emoji} GitHub · Issue\n\n"
-            f"📦 Репозиторий:\n{repo}\n"
-            f"👤 Автор:\n{author}\n"
-            f"🕒 Время:\n{received_str}\n\n"
-            f"📝 Issue #{num} {action}:\n{msg}"
-        )
-        repo_url = issue.get("html_url", repo_url)
-
+        body_lines = [f"Issue #{num} {action}: {msg}"]
+        kind_title = "🐞 GitHub · Issue"
+        title = f"{kind_title}\n\n📦 {repo} · Issue #{num} {action}"
     else:
         return {"status": "ignored"}
 
     event_id = str(uuid.uuid4())
     GITHUB_EVENTS[event_id] = {"payload": payload, "created_at": received_at}
 
-    # save event to DB (include received_at field if present in schema)
-    event_record = {
-        "user_id": user_id,
-        "source": "github",
-        "title": title,
-        "data": payload,
-        "received_at": received_at.isoformat()
-    }
+    # store event in DB with fallback if received_at column absent
+    event_record = {"user_id": user_id, "source": "github", "title": title, "data": payload, "received_at": received_at.isoformat()}
     try:
         supabase.table("events").insert(event_record).execute()
     except Exception:
@@ -645,12 +539,21 @@ async def github_webhook(webhook_id: str, request: Request):
         except Exception:
             raise
 
-    # check notifications_enabled flag
+    # check notifications flag
     notify = True
-    if "notifications_enabled" in wh.data[0]:
-        notify = bool(wh.data[0]["notifications_enabled"])
+    if "notifications_enabled" in wh_row:
+        notify = bool(wh_row["notifications_enabled"])
 
     if notify:
-        send_message(chat_id, title, github_event_keyboard(event_id, repo_url))
+        # build unified text using helper
+        # if body_lines empty, provide short summary line
+        if not body_lines:
+            # try to create short body from title/commit count
+            if event == "push":
+                body_lines = [f"{commits} new commit(s)"]
+            else:
+                body_lines = [title.splitlines()[0]]
+        message_text = build_event_text(kind_title, repo, author, received_str, body_lines)
+        send_message(chat_id, message_text, github_event_keyboard(event_id, repo_url))
 
     return {"status": "ok"}
