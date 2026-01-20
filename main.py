@@ -1,9 +1,11 @@
-# main.py
 import os
 import uuid
 import time
 import threading
 import requests
+import secrets
+import hmac
+import hashlib
 from json import JSONDecodeError
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Body, Request
@@ -47,6 +49,19 @@ threading.Thread(target=ttl_cleaner, daemon=True).start()
 # =========================
 # HELPERS: формат времени, склонения, утилиты
 # =========================
+def verify_github_signature(body: bytes, signature_header: str | None, secret: str | None) -> bool:
+    """Проверяет подпись GitHub webhook (X-Hub-Signature-256)."""
+    if not signature_header or not secret:
+        return False
+    try:
+        algo, signature = signature_header.split("=")
+    except ValueError:
+        return False
+    if algo != "sha256":
+        return False
+    mac = hmac.new(secret.encode(), msg=body, digestmod=hashlib.sha256)
+    return hmac.compare_digest(mac.hexdigest(), signature)
+
 def fmt_dt(dt):
     """Форматирует datetime или ISO-строку в 'DD.MM.YYYY HH:MM UTC' (без секунд)."""
     if not dt:
@@ -92,6 +107,69 @@ def strip_time_from_title(title: str) -> str:
         return title[:idx]
     # сохраним части без блока времени
     return (title[:idx] + title[after+2:]).strip()
+
+def md_escape(text: str) -> str:
+    """
+    Экранирует наиболее проблемные символы для Telegram Markdown (v1).
+    Мы экранируем только части текста, которые вставляем в Markdown-сообщение,
+    чтобы подчёркивания, звёздочки и прочее отображались как текст.
+    """
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    # сначала экранируем обратный слеш
+    text = text.replace("\\", "\\\\")
+    for ch in ["_", "*", "`", "[", "]", "(", ")"]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+def format_commit_author(author: dict | None) -> str:
+    """
+    Форматирует автора коммита: 'Name (username)' при наличии обоих.
+    Результат уже экранирован под Markdown.
+    """
+    if not author:
+        return ""
+    name = author.get("name")
+    username = author.get("username")
+    if name and username:
+        return f"{md_escape(name)} ({md_escape(username)})"
+    if name:
+        return md_escape(name)
+    if username:
+        return md_escape(username)
+    return ""
+
+def extract_repo_from_title(title: str) -> str:
+    """
+    Пытаемся найти строку с '📦 Репозиторий:' в title и вернуть следующую строку.
+    Если не нашли — возвращаем пустую строку.
+    """
+    if not title:
+        return ""
+    marker = "📦 Репозиторий:"
+    idx = title.find(marker)
+    if idx == -1:
+        return ""
+    # получаем подпоследовательность после маркера
+    after = title[idx + len(marker):].lstrip("\n ")
+    # возьмём первую строку из after
+    repo_line = after.splitlines()[0] if after.splitlines() else ""
+    return repo_line.strip()
+
+def short_preview_from_title(title: str) -> str:
+    """
+    Делает короткое превью: первая строка title (например "🔔 GitHub · Push")
+    и, если есть, добавляет имя репозитория.
+    """
+    if not title:
+        return ""
+    first_line = title.splitlines()[0]
+    repo = extract_repo_from_title(title)
+    if repo:
+        return f"{first_line} · {repo}"
+    return first_line
 
 # =========================
 # TELEGRAM HELPERS (send/edit/delete)
@@ -226,6 +304,79 @@ def load_more_keyboard(next_offset: int):
     return {"inline_keyboard": [[{"text": "Загрузить ещё 3", "callback_data": f"load_more:{next_offset}"}]]}
 
 # =========================
+# Notifications list builder (short, with pager)
+# =========================
+def build_notifications_list_short(evs, offset=0, total=0):
+    """
+    Формирует компактный список уведомлений без верхней строки с "X из Y".
+    Внизу остаётся навигационная строка (⬅️ / центр / Вперёд ➡️).
+    """
+    REPO_DISPLAY_MAX = 18  # макс длина репо в превью (без многоточия)
+
+    lines = []
+    inline_rows = []
+
+    for e in evs:
+        title = e.get("title") or ""
+        first_line = title.splitlines()[0] if title else ""
+        first_line = md_escape(first_line)[:150]
+
+        created = fmt_dt(e.get("received_at") or e.get("created_at"))
+
+        # берём репозиторий прямо из payload (более надёжно)
+        payload = e.get("data") or {}
+        repo_raw = (payload.get("repository") or {}).get("name")
+        repo_display = ""
+        if repo_raw:
+            repo_raw = repo_raw.strip()
+            if len(repo_raw) > REPO_DISPLAY_MAX:
+                repo_display = md_escape(repo_raw[:REPO_DISPLAY_MAX - 1] + "…")
+            else:
+                repo_display = md_escape(repo_raw)
+
+        if repo_display:
+            lines.append(f"• {first_line} · {repo_display}\n`{created}`")
+        else:
+            lines.append(f"• {first_line}\n`{created}`")
+
+        # Левая кнопка — детали
+        left_label = first_line[:60] or "Подробнее"
+        row = [{
+            "text": left_label,
+            "callback_data": f"details:{e.get('id')}"
+        }]
+
+        # Правая кнопка — всегда одинаковая подпись (если есть url)
+        repo_url = (payload.get("repository") or {}).get("html_url") or e.get("repo_url") or ""
+        if repo_url:
+            row.append({
+                "text": "🌐 В GitHub",
+                "url": repo_url
+            })
+
+        inline_rows.append(row)
+
+    # Навигационная строка (внизу)
+    displayed_to = min(offset + len(evs), total) if total else (offset + len(evs))
+    nav_row = []
+    if offset > 0:
+        prev_offset = max(0, offset - NOTIF_PAGE_SIZE)
+        nav_row.append({"text": "⬅️ Назад", "callback_data": f"page:{prev_offset}"})
+    # центр — показывает текущий просмотр (noop)
+    nav_row.append({"text": f"{displayed_to} из {total}", "callback_data": f"noop:0"})
+    if total and (offset + NOTIF_PAGE_SIZE) < total:
+        next_offset = offset + NOTIF_PAGE_SIZE
+        nav_row.append({"text": "Вперёд ➡️", "callback_data": f"page:{next_offset}"})
+
+    if nav_row:
+        inline_rows.append(nav_row)
+
+    header = "📜 *Последние уведомления:*\n\n"
+    text = header + ("\n\n".join(lines) if lines else "Пока нет событий.")
+    keyboard = {"inline_keyboard": inline_rows}
+    return text, keyboard
+
+# =========================
 # TELEGRAM UPDATE ENDPOINT
 # =========================
 @app.post("/telegram")
@@ -239,6 +390,61 @@ async def telegram_update(payload: dict = Body(...)):
         chat_id = chat.get("id")
         message_id = message.get("message_id")
         answer_callback(callback.get("id"))
+
+        # NOOP (просто acknowledge)
+        if data.startswith("noop:"):
+            return {"ok": True}
+
+        # PAGE navigation handler
+        if data.startswith("page:"):
+            try:
+                offset = int(data.split(":", 1)[1])
+            except Exception:
+                offset = 0
+
+            try:
+                user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
+                if not user_row.data:
+                    send_message(chat_id, "❌ Пользователь не найден.", main_keyboard())
+                    return {"ok": True}
+                user_id = user_row.data[0]["id"]
+
+                # total count (try to get count; SDK may provide .count)
+                try:
+                    count_res = supabase.table("events").select("id", count="exact").eq("user_id", user_id).execute()
+                    total = getattr(count_res, "count", None)
+                    if total is None:
+                        # fallback: if .data present and count not provided, try length via separate lightweight query
+                        # caution: this fetches up to NOTIF_PAGE_SIZE items if head used; here fallback to another select
+                        all_res = supabase.table("events").select("id").eq("user_id", user_id).execute()
+                        total = len(all_res.data) if all_res.data is not None else 0
+                except Exception:
+                    total = 0
+
+                evs_res = supabase.table("events") \
+                    .select("id,title,received_at,data,created_at") \
+                    .eq("user_id", user_id) \
+                    .order("created_at", desc=True) \
+                    .range(offset, offset + NOTIF_PAGE_SIZE - 1) \
+                    .execute()
+
+                if not evs_res.data:
+                    edit_message_text(chat_id, message_id, "Больше уведомлений нет.", None)
+                    return {"ok": True}
+
+                # enrich with repo_url if possible
+                evs = evs_res.data
+                for row in evs:
+                    payload_row = row.get("data") or {}
+                    row["repo_url"] = (payload_row.get("repository") or {}).get("html_url", "")
+
+                text_out, kb = build_notifications_list_short(evs, offset=offset, total=total)
+                edit_message_text(chat_id, message_id, text_out, kb)
+                return {"ok": True}
+            except Exception as e:
+                print("DB error in page handler:", e)
+                send_message(chat_id, "❌ Ошибка сервера.", main_keyboard())
+                return {"ok": True}
 
         # DETAILS handler
         if data.startswith("details:"):
@@ -277,8 +483,8 @@ async def telegram_update(payload: dict = Body(...)):
                 commits_count = len(payload_data.get("commits") or [])
                 summary = (
                     "🔔 GitHub · Push\n\n"
-                    f"📦 Репозиторий:\n{repo}\n"
-                    f"👤 Автор:\n{author}\n"
+                    f"📦 Репозиторий:\n{md_escape(repo)}\n"
+                    f"👤 Автор:\n{md_escape(author)}\n"
                     f"🕒 Время:\n{created_str}\n\n"
                     f"📝 {pluralize_commits(commits_count)}"
                 )
@@ -288,12 +494,13 @@ async def telegram_update(payload: dict = Body(...)):
             for i, c in enumerate(commits, 1):
                 msg = (c.get("message") or "").splitlines()[0]
                 url = c.get("url") or c.get("html_url") or ""
-                author_c = (c.get("author") or {}).get("name") or (c.get("author") or {}).get("username") or ""
-                commits_text += f"{i}) {msg}"
+                author_c = format_commit_author(c.get("author"))
+
+                commits_text += f"{i}) {md_escape(msg)}"
                 if author_c:
                     commits_text += f" — {author_c}"
                 if url:
-                    commits_text += f"\n   {url}"
+                    commits_text += f"\n   📎 [посмотреть коммит]({url})"
                 commits_text += "\n"
 
             commits_count = len(commits)
@@ -301,8 +508,6 @@ async def telegram_update(payload: dict = Body(...)):
 
             details_msg = (
                 f"📄 *Событие*\n\n"
-                f"Источник: `github`\n"
-                f"Дата и время прихода: `{created_str}`\n\n"
                 f"{summary}\n\n"
             )
             if commits_count > 0:
@@ -377,49 +582,6 @@ async def telegram_update(payload: dict = Body(...)):
             send_message(chat_id, "⚠️ Удалить этот сервис?", confirm_keyboard())
             return {"ok": True}
 
-        # LOAD_MORE pagination
-        if data.startswith("load_more:"):
-            try:
-                offset = int(data.split(":", 1)[1])
-            except Exception:
-                offset = 0
-
-            # delete the "Загрузить ещё" message
-            try:
-                delete_message(chat_id, message_id)
-            except Exception:
-                pass
-
-            try:
-                user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
-                if not user_row.data:
-                    send_message(chat_id, "❌ Пользователь не найден.", main_keyboard())
-                    return {"ok": True}
-                user_id = user_row.data[0]["id"]
-
-                evs = supabase.table("events") \
-                    .select("id,title,received_at") \
-                    .eq("user_id", user_id) \
-                    .order("created_at", desc=True) \
-                    .range(offset, offset + NOTIF_PAGE_SIZE - 1) \
-                    .execute()
-
-                if not evs.data:
-                    send_message(chat_id, "Пока нет дополнительных уведомлений.", main_keyboard())
-                    return {"ok": True}
-
-                for e in evs.data:
-                    preview = e.get("title", "")
-                    send_message(chat_id, f"{preview}", event_open_keyboard(e.get("id")))
-
-                if len(evs.data) == NOTIF_PAGE_SIZE:
-                    send_message(chat_id, "Загрузить ещё:", load_more_keyboard(offset + NOTIF_PAGE_SIZE))
-                return {"ok": True}
-            except Exception as e:
-                print("DB error in load_more:", e)
-                send_message(chat_id, "❌ Ошибка сервера.", main_keyboard())
-                return {"ok": True}
-
         return {"ok": True}
 
     # ---------- MESSAGE handling ----------
@@ -478,13 +640,18 @@ async def telegram_update(payload: dict = Body(...)):
                 send_message(chat_id, "❌ Не получилось создать пользователя. Попробуй ещё раз.", main_keyboard())
                 return {"ok": True}
             user_id = user_row.data[0]["id"]
+            
+            # Генерируем уникальный secret для этого webhook
+            github_secret = secrets.token_hex(32)
+            
             wh = supabase.table("webhooks").insert({
                 "user_id": user_id,
                 "source": "github",
                 "connected": False,
                 "display_name": "GitHub (ожидает подключения)",
                 "notifications_enabled": True,
-                "events_enabled": {"push": True, "pull_request": True, "issues": True}
+                "events_enabled": {"push": True, "pull_request": True, "issues": True},
+                "github_secret": github_secret
             }).execute()
             if not wh.data:
                 send_message(chat_id, "❌ Не удалось создать webhook. Попробуй позже.", main_keyboard())
@@ -494,8 +661,9 @@ async def telegram_update(payload: dict = Body(...)):
                          "🔗 *Подключение GitHub*\n\n"
                          "1️⃣ Зайди в репозиторий GitHub\n"
                          "2️⃣ Settings → Webhooks → Add webhook\n"
-                         "3️⃣ Вставь Payload URL из бота:\n"
-                         f"`{url}`\n\n"
+                         "3️⃣ Вставь данные из бота:\n\n"
+                         f"*Payload URL:*\n`{url}`\n\n"
+                         f"*Secret:*\n`{github_secret}`\n\n"
                          "4️⃣ Content type: `application/json`\n"
                          "5️⃣ Events: Push, Pull requests, Issues\n\n"
                          "После подключения события начнут приходить сюда 👇",
@@ -528,7 +696,7 @@ async def telegram_update(payload: dict = Body(...)):
             send_message(chat_id, "❌ Ошибка сервера.", main_keyboard())
             return {"ok": True}
 
-    # last notifications (first page)
+    # last notifications (first page) — теперь одно компактное сообщение + pager
     if text == "📜 Последние уведомления":
         try:
             user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
@@ -536,21 +704,35 @@ async def telegram_update(payload: dict = Body(...)):
                 send_message(chat_id, "❌ Пользователь не найден.", main_keyboard())
                 return {"ok": True}
             user_id = user_row.data[0]["id"]
-            evs = supabase.table("events") \
-                .select("id,title,received_at") \
+
+            # total count (try to get count; SDK may provide .count)
+            try:
+                count_res = supabase.table("events").select("id", count="exact").eq("user_id", user_id).execute()
+                total = getattr(count_res, "count", None)
+                if total is None:
+                    all_res = supabase.table("events").select("id").eq("user_id", user_id).execute()
+                    total = len(all_res.data) if all_res.data is not None else 0
+            except Exception:
+                total = 0
+
+            evs_res = supabase.table("events") \
+                .select("id,title,received_at,data,created_at") \
                 .eq("user_id", user_id) \
                 .order("created_at", desc=True) \
                 .range(0, NOTIF_PAGE_SIZE - 1) \
                 .execute()
-            if not evs.data:
+
+            if not evs_res.data:
                 send_message(chat_id, "Пока нет событий.\n\nЕсли кажется, что что-то не работает — напиши @ligr5", main_keyboard())
                 return {"ok": True}
-            send_message(chat_id, "📜 *Последние уведомления:*", main_keyboard())
-            for e in evs.data:
-                preview = e.get("title", "")
-                send_message(chat_id, f"{preview}", event_open_keyboard(e.get("id")))
-            if len(evs.data) == NOTIF_PAGE_SIZE:
-                send_message(chat_id, "Загрузить ещё:", load_more_keyboard(NOTIF_PAGE_SIZE))
+
+            evs = evs_res.data
+            for row in evs:
+                payload = row.get("data") or {}
+                row["repo_url"] = (payload.get("repository") or {}).get("html_url", "")
+
+            text_out, kb = build_notifications_list_short(evs, offset=0, total=total)
+            send_message(chat_id, text_out, kb)
             return {"ok": True}
         except Exception as e:
             print("DB error last_notifications:", e)
@@ -642,13 +824,60 @@ async def github_webhook(webhook_id: str, request: Request):
 
     event = (request.headers.get("X-GitHub-Event") or "").lower()
 
-    # Handle ping early — respond 200 and optionally mark connected
+    # Handle ping early — respond 200 and optionally mark connected + update display_name if repo present
     if event == "ping":
+        repo = (payload.get("repository") or {}).get("name")
+
+        # получаем webhook + user_id + chat_id
         try:
-            supabase.table("webhooks").update({"connected": True}).eq("id", webhook_id).execute()
-        except Exception:
-            pass
+            wh_res = supabase.table("webhooks") \
+                .select("user_id,connected") \
+                .eq("id", webhook_id) \
+                .execute()
+            if not wh_res.data:
+                return {"status": "unknown_webhook"}
+            wh = wh_res.data[0]
+        except Exception as e:
+            print("Ping select webhook error:", e)
+            return {"status": "error"}
+
+        was_connected = bool(wh.get("connected"))
+
+        update_data = {"connected": True}
+        if repo:
+            update_data["display_name"] = f"GitHub ({md_escape(repo)})"
+
+        try:
+            supabase.table("webhooks") \
+                .update(update_data) \
+                .eq("id", webhook_id) \
+                .execute()
+        except Exception as e:
+            print("Ping update error:", e)
+
+        # отправляем сообщение ТОЛЬКО при первом подключении
+        if not was_connected:
+            try:
+                user_row = supabase.table("users") \
+                    .select("chat_id") \
+                    .eq("id", wh["user_id"]) \
+                    .execute()
+                if user_row.data:
+                    chat_id = user_row.data[0]["chat_id"]
+                    service_name = f"GitHub ({md_escape(repo)})" if repo else "GitHub"
+
+                    send_message(
+                        chat_id,
+                        "✅ *Сервис подключён*\n\n"
+                        f"{service_name}\n"
+                        "Теперь события будут приходить в этот чат 🚀",
+                        main_keyboard()
+                    )
+            except Exception as e:
+                print("Ping notify error:", e)
+
         return {"status": "pong"}
+
 
     # Ensure webhook exists
     try:
@@ -686,9 +915,20 @@ async def github_webhook(webhook_id: str, request: Request):
         print("DB error selecting user:", e)
         return {"status": "error", "reason": "db_select_failed"}
 
-    # update display_name/connected
+    # update connected + display_name (only when repo is known)
+    update_data = {
+        "connected": True
+    }
+
+    if repo and repo != "unknown":
+        # сохраняем display_name уже экранированным, чтобы при выводе в Telegram подчёркивания показывались
+        update_data["display_name"] = f"GitHub ({md_escape(repo)})"
+
     try:
-        supabase.table("webhooks").update({"connected": True, "display_name": f"GitHub ({repo})"}).eq("id", webhook_id).execute()
+        supabase.table("webhooks") \
+            .update(update_data) \
+            .eq("id", webhook_id) \
+            .execute()
     except Exception as e:
         print("DB warning updating webhook:", e)
 
@@ -701,10 +941,11 @@ async def github_webhook(webhook_id: str, request: Request):
             commits = len(payload.get("commits") or [])
             author = (payload.get("sender") or {}).get("login", "unknown")
             commits_line = pluralize_commits(commits)
+            # экранируем части для Markdown
             title = (
                 "🔔 GitHub · Push\n\n"
-                f"📦 Репозиторий:\n{repo}\n"
-                f"👤 Автор:\n{author}\n"
+                f"📦 Репозиторий:\n{md_escape(repo)}\n"
+                f"👤 Автор:\n{md_escape(author)}\n"
                 f"🕒 Время:\n{received_str}\n\n"
                 f"📝 {commits_line}"
             )
@@ -719,10 +960,10 @@ async def github_webhook(webhook_id: str, request: Request):
                 emoji = "✅" if pr.get("merged") else "❌" if action == "closed" else "🔀"
                 title = (
                     f"{emoji} GitHub · Pull Request\n\n"
-                    f"📦 Репозиторий:\n{repo}\n"
-                    f"👤 Автор:\n{author}\n"
+                    f"📦 Репозиторий:\n{md_escape(repo)}\n"
+                    f"👤 Автор:\n{md_escape(author)}\n"
                     f"🕒 Время:\n{received_str}\n\n"
-                    f"📝 PR #{num} {state}:\n{msg}"
+                    f"📝 PR #{num} {state}:\n{md_escape(msg)}"
                 )
                 repo_url = pr.get("html_url") or repo_url
             else:
@@ -737,10 +978,10 @@ async def github_webhook(webhook_id: str, request: Request):
                 emoji = "🐞" if action == "opened" else "✅"
                 title = (
                     f"{emoji} GitHub · Issue\n\n"
-                    f"📦 Репозиторий:\n{repo}\n"
-                    f"👤 Автор:\n{author}\n"
+                    f"📦 Репозиторий:\n{md_escape(repo)}\n"
+                    f"👤 Автор:\n{md_escape(author)}\n"
                     f"🕒 Время:\n{received_str}\n\n"
-                    f"📝 Issue #{num} {action}:\n{msg}"
+                    f"📝 Issue #{num} {action}:\n{md_escape(msg)}"
                 )
                 repo_url = issue.get("html_url") or repo_url
             else:
