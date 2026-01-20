@@ -803,6 +803,29 @@ async def github_webhook(webhook_id: str, request: Request):
         print("Error reading body:", e)
         body_bytes = b""
 
+    # =========================
+    # GitHub signature verification (X-Hub-Signature-256)
+    # =========================
+    signature = request.headers.get("X-Hub-Signature-256")
+
+    try:
+        wh_sec = supabase.table("webhooks") \
+            .select("github_secret") \
+            .eq("id", webhook_id) \
+            .execute()
+    except Exception as e:
+        print("❌ DB error while fetching webhook secret:", e)
+        return {"status": "error"}
+
+    if not wh_sec.data:
+        print("❌ Webhook not found:", webhook_id)
+        return {"status": "unknown_webhook"}
+
+    secret = wh_sec.data[0].get("github_secret")
+
+    if not verify_github_signature(body_bytes, signature, secret):
+        print("❌ Invalid GitHub signature")
+        return {"status": "forbidden"}
     payload = {}
     if body_bytes:
         try:
