@@ -108,6 +108,18 @@ def strip_time_from_title(title: str) -> str:
     # сохраним части без блока времени
     return (title[:idx] + title[after+2:]).strip()
 
+# === добавьте этот хелпер сразу после strip_time_from_title ===
+def strip_commits_line(title: str) -> str:
+    """
+    Убирает строку(и) с подсчётом коммитов вида '📝 ...' из заголовка,
+    чтобы не дублировать счётчик в деталях.
+    """
+    if not title:
+        return title
+    lines = title.splitlines()
+    filtered = [ln for ln in lines if not ln.strip().startswith("📝 ")]
+    return "\n".join(filtered).strip()
+
 def md_escape(text: str) -> str:
     """
     Экранирует наиболее проблемные символы для Telegram Markdown (v1).
@@ -415,7 +427,6 @@ async def telegram_update(payload: dict = Body(...)):
                     total = getattr(count_res, "count", None)
                     if total is None:
                         # fallback: if .data present and count not provided, try length via separate lightweight query
-                        # caution: this fetches up to NOTIF_PAGE_SIZE items if head used; here fallback to another select
                         all_res = supabase.table("events").select("id").eq("user_id", user_id).execute()
                         total = len(all_res.data) if all_res.data is not None else 0
                 except Exception:
@@ -476,19 +487,23 @@ async def telegram_update(payload: dict = Body(...)):
             author = (payload_data.get("sender") or {}).get("login", "unknown")
             created_str = fmt_dt(created_at)
 
-            # use stored_title if exists else reconstruct
+            # Build summary WITHOUT the quick-preview/banner and WITHOUT the commit-count line duplicated.
             if stored_title:
+                # strip the time block if present
                 summary = strip_time_from_title(stored_title)
+                # remove any lines that start with the commits marker "📝 " to avoid duplication
+                lines = [ln for ln in summary.splitlines() if not ln.strip().startswith("📝 ")]
+                summary = "\n".join(lines).strip()
             else:
-                commits_count = len(payload_data.get("commits") or [])
+                # construct summary without commit count line
                 summary = (
                     "🔔 GitHub · Push\n\n"
                     f"📦 Репозиторий:\n{md_escape(repo)}\n"
                     f"👤 Автор:\n{md_escape(author)}\n"
                     f"🕒 Время:\n{created_str}\n\n"
-                    f"📝 {pluralize_commits(commits_count)}"
                 )
 
+            # Prepare commits details
             commits = payload_data.get("commits") or []
             commits_text = ""
             for i, c in enumerate(commits, 1):
@@ -506,10 +521,8 @@ async def telegram_update(payload: dict = Body(...)):
             commits_count = len(commits)
             commits_count_line = pluralize_commits(commits_count)
 
-            details_msg = (
-                f"📄 *Событие*\n\n"
-                f"{summary}\n\n"
-            )
+            # details message: do NOT include the previous "quick preview" banner; include commit count once
+            details_msg = f"{summary}\n\n"
             if commits_count > 0:
                 details_msg += f"📝 {commits_count_line}\n\n*Подробности коммитов:*\n{commits_text}"
             else:
@@ -640,10 +653,10 @@ async def telegram_update(payload: dict = Body(...)):
                 send_message(chat_id, "❌ Не получилось создать пользователя. Попробуй ещё раз.", main_keyboard())
                 return {"ok": True}
             user_id = user_row.data[0]["id"]
-            
+
             # Генерируем уникальный secret для этого webhook
             github_secret = secrets.token_hex(32)
-            
+
             wh = supabase.table("webhooks").insert({
                 "user_id": user_id,
                 "source": "github",
@@ -679,7 +692,7 @@ async def telegram_update(payload: dict = Body(...)):
         try:
             user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
             if not user_row.data:
-                send_message(chat_id, "❌ Пользователь не найден.", main_keyboard())
+                send_message(chat_id, "📦 У тебя пока нет сервисов.\n\nЕсли есть вопросы — напиши @ligr5", main_keyboard())
                 return {"ok": True}
             user_id = user_row.data[0]["id"]
             res = supabase.table("webhooks").select("id,display_name,connected").eq("user_id", user_id).execute()
@@ -696,7 +709,7 @@ async def telegram_update(payload: dict = Body(...)):
             send_message(chat_id, "❌ Ошибка сервера.", main_keyboard())
             return {"ok": True}
 
-    # last notifications (first page) — теперь одно компактное сообщение + pager
+    # last notifications (first page) — одно компактное сообщение + pager
     if text == "📜 Последние уведомления":
         try:
             user_row = supabase.table("users").select("id").eq("chat_id", chat_id).execute()
