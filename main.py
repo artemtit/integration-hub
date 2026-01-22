@@ -299,7 +299,6 @@ def service_settings_keyboard(webhook_id: str, events: dict):
         ]
     }
 
-
 def github_event_keyboard(event_id: str, url: str):
     return {
         "inline_keyboard": [[
