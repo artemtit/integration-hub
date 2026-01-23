@@ -30,7 +30,8 @@ app = FastAPI()
 # =========================
 GITHUB_EVENTS = {}      # event_id -> {"payload": ..., "created_at": datetime}
 PENDING_DELETE = {}     # chat_id -> webhook_id (text-confirmation flow)
-TTL_HOURS = 24
+# Самоудаление: внутренний кеш — 7 дней (в часах)
+TTL_HOURS = 24 * 7
 NOTIF_PAGE_SIZE = 3     # сколько уведомлений показываем по умолчанию
 
 # =========================
@@ -45,6 +46,25 @@ def ttl_cleaner():
         time.sleep(600)
 
 threading.Thread(target=ttl_cleaner, daemon=True).start()
+
+# =========================
+# DB CLEANER (удаление старых событий из БД)
+# =========================
+def db_event_cleaner():
+    """
+    Периодически удаляет события из таблицы events старше 7 дней.
+    Запускается в фоне и выполняется раз в час.
+    """
+    while True:
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=7)
+            # предполагаем, что Supabase создает поле created_at; удаляем по нему
+            supabase.table("events").delete().lt("created_at", cutoff.isoformat()).execute()
+        except Exception as e:
+            print("DB cleaner error:", e)
+        time.sleep(3600)
+
+threading.Thread(target=db_event_cleaner, daemon=True).start()
 
 # =========================
 # HELPERS: формат времени, склонения, утилиты
@@ -108,16 +128,23 @@ def strip_time_from_title(title: str) -> str:
     # сохраним части без блока времени
     return (title[:idx] + title[after+2:]).strip()
 
-# === добавьте этот хелпер сразу после strip_time_from_title ===
 def strip_commits_line(title: str) -> str:
     """
     Убирает строку(и) с подсчётом коммитов вида '📝 ...' из заголовка,
     чтобы не дублировать счётчик в деталях.
+    Более устойчиво: удаляет строки, содержащие символ '📝' в начале строки
+    или сразу после пробелов.
     """
     if not title:
         return title
     lines = title.splitlines()
-    filtered = [ln for ln in lines if not ln.strip().startswith("📝 ")]
+    filtered = []
+    for ln in lines:
+        ln_stripped = ln.lstrip()
+        # если строка начинается с символа '📝' (включая возможные пробелы), пропускаем её
+        if ln_stripped.startswith("📝"):
+            continue
+        filtered.append(ln)
     return "\n".join(filtered).strip()
 
 def md_escape(text: str) -> str:
@@ -267,12 +294,15 @@ def confirm_keyboard():
     }
 
 def faq_keyboard():
+    # расширенная клавиатура популярных вопросов
     return {
         "keyboard": [
             [{"text": "❓ Как подключить GitHub"}],
             [{"text": "❓ Почему сервис не подключён"}],
             [{"text": "❓ Что означают статусы"}],
             [{"text": "❓ Почему нет событий"}],
+            [{"text": "❓ Как отключить уведомления"}],
+            [{"text": "❓ Как сменить репозиторий"}],
             [{"text": "⬅️ Назад"}]
         ],
         "resize_keyboard": True
@@ -300,12 +330,20 @@ def service_settings_keyboard(webhook_id: str, events: dict):
     }
 
 def github_event_keyboard(event_id: str, url: str):
-    return {
-        "inline_keyboard": [[
-            {"text": "🌐 Открыть на GitHub", "url": url},
-            {"text": "📄 Подробнее", "callback_data": f"details:{event_id}"}
-        ]]
-    }
+    # Поменяли порядок: слева — Подробнее (callback), справа — короткая ссылка "В github"
+    if url:
+        return {
+            "inline_keyboard": [[
+                {"text": "📄 Подробнее", "callback_data": f"details:{event_id}"},
+                {"text": "В github", "url": url}
+            ]]
+        }
+    else:
+        return {
+            "inline_keyboard": [[
+                {"text": "📄 Подробнее", "callback_data": f"details:{event_id}"}
+            ]]
+        }
 
 def event_open_keyboard(event_id: str):
     return {
@@ -351,18 +389,17 @@ def build_notifications_list_short(evs, offset=0, total=0):
         else:
             lines.append(f"• {first_line}\n`{created}`")
 
-        # Левая кнопка — детали
+        # Левый — детали (callback), Правый — короткая ссылка "В github"
         left_label = first_line[:60] or "Подробнее"
         row = [{
             "text": left_label,
             "callback_data": f"details:{e.get('id')}"
         }]
 
-        # Правая кнопка — всегда одинаковая подпись (если есть url)
         repo_url = (payload.get("repository") or {}).get("html_url") or e.get("repo_url") or ""
         if repo_url:
             row.append({
-                "text": "🌐 В GitHub",
+                "text": "В github",
                 "url": repo_url
             })
 
@@ -489,11 +526,9 @@ async def telegram_update(payload: dict = Body(...)):
 
             # Build summary WITHOUT the quick-preview/banner and WITHOUT the commit-count line duplicated.
             if stored_title:
-                # strip the time block if present
+                # strip the time block if present, и убираем строку с коммитами
                 summary = strip_time_from_title(stored_title)
-                # remove any lines that start with the commits marker "📝 " to avoid duplication
-                lines = [ln for ln in summary.splitlines() if not ln.strip().startswith("📝 ")]
-                summary = "\n".join(lines).strip()
+                summary = strip_commits_line(summary)
             else:
                 # construct summary without commit count line
                 summary = (
@@ -768,8 +803,7 @@ async def telegram_update(payload: dict = Body(...)):
                      "2️⃣ Settings → Webhooks → Add webhook\n"
                      "3️⃣ Вставь Payload URL из бота\n"
                      "4️⃣ Content type: `application/json`\n"
-                     "5️⃣ Events: Push, Pull requests, Issues\n\n"
-                     "Если остались вопросы — напиши @ligr5",
+                     "5️⃣ Events: Push, Pull requests, Issues",
                      faq_keyboard())
         return {"ok": True}
 
@@ -777,16 +811,14 @@ async def telegram_update(payload: dict = Body(...)):
         send_message(chat_id,
                      "🔴 Статус «ожидает подключения» означает,\n"
                      "что GitHub ещё не отправил ни одного события.\n\n"
-                     "Сделай любой push или GitHub пришлёт ping — статус обновится.\n\n"
-                     "Если остались вопросы — напиши @ligr5",
+                     "Сделай любой push или GitHub пришлёт ping — статус обновится.",
                      faq_keyboard())
         return {"ok": True}
 
     if text == "❓ Что означают статусы":
         send_message(chat_id,
                      "🟢 — сервис подключён и присылает события\n"
-                     "🔴 — ожидает первого события от GitHub\n\n"
-                     "Если остались вопросы — напиши @ligr5",
+                     "🔴 — ожидает первого события от GitHub",
                      faq_keyboard())
         return {"ok": True}
 
@@ -795,8 +827,20 @@ async def telegram_update(payload: dict = Body(...)):
                      "Если событий нет:\n"
                      "• не было push / PR / issues\n"
                      "• webhook ещё не подключён\n"
-                     "• репозиторий неактивен\n\n"
-                     "Если остались вопросы — напиши @ligr5",
+                     "• репозиторий неактивен",
+                     faq_keyboard())
+        return {"ok": True}
+
+    if text == "❓ Как отключить уведомления":
+        send_message(chat_id,
+                     "Перейди в '📦 Мои сервисы' → выбери сервис → ⚙️ Управление сервисом → выключи переключатель уведомлений (Push / PR / Issues).",
+                     faq_keyboard())
+        return {"ok": True}
+
+    if text == "❓ Как сменить репозиторий":
+        send_message(chat_id,
+                     "Чтобы получать события из другого репозитория, создай новый webhook в нужном репозитории и вставь Payload URL из бота. "
+                     "Если нужно — удали старый сервис через управление сервисом.",
                      faq_keyboard())
         return {"ok": True}
 
